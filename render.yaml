@@ -5,10 +5,11 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
       - key: POSTGRES_URL
         scope: run
-        value: ${POSTGRES_URL}
       - key: GEMINI_API_KEY
         scope: run
-        value: ${GEMINI_API_KEY}
+      - key: PYTHON_VERSION
+        value: "3.11"
