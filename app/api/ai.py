@@ -55,16 +55,8 @@ def list_ai_entities(
     
     result = []
     for r in rows:
-        entity_id = r[0]
-        # Fetch concepts for this entity
-        cursor.execute(
-            "SELECT DISTINCT concept FROM ai_verse_concepts WHERE verse_id IN (SELECT verse_id FROM ai_verse_entities WHERE entity_id = %s) LIMIT 10",
-            (entity_id,)
-        )
-        concepts = [row[0] for row in cursor.fetchall()]
-        
         result.append({
-            "id": entity_id,
+            "id": r[0],
             "name": r[1],
             "sanskrit_name": r[2],
             "entity_type": r[3],
@@ -72,7 +64,7 @@ def list_ai_entities(
             "aliases": r[5],
             "mention_count": r[6],
             "verse_count": r[7],
-            "concepts": concepts,
+            "concepts": [],
         })
     
     cursor.close()
