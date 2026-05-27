@@ -50,7 +50,7 @@ def get_conn():
     return psycopg.connect(DATABASE_URL)
 
 
-BATCH_SIZE = 4
+BATCH_SIZE = 1
 RPM_LIMIT  = 1       # requests per minute
 SLEEP_SECS = 60      # 60 seconds between calls
 
@@ -157,10 +157,41 @@ def ai_link_verse_entity(verse_id: int, entity_id: int, mention_source: str = 'v
     conn.close()
 
 
+def ai_save_verse_concepts(verse_id: int, concepts: list) -> int:
+    """Save concepts (themes, virtues, philosophical principles) for a verse."""
+    if not concepts:
+        return 0
+    
+    conn = get_conn()
+    cursor = conn.cursor()
+    count = 0
+    
+    for concept in concepts:
+        concept = concept.strip().lower() if isinstance(concept, str) else ""
+        if not concept:
+            continue
+        
+        try:
+            cursor.execute("""
+                INSERT INTO ai_verse_concepts (verse_id, concept)
+                VALUES (%s, %s)
+            """, (verse_id, concept))
+            count += 1
+        except psycopg.IntegrityError:
+            # Concept already saved for this verse, skip
+            pass
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    return count
+
+
 def save_extraction_results(verses: list, result: dict) -> dict:
     """Persist extracted entities/relationships into the AI-specific tables."""
     stats = {"entities_created": 0, "entities_reused": 0,
-             "relationships_created": 0, "mentions_created": 0}
+             "relationships_created": 0, "mentions_created": 0, "concepts_created": 0}
 
     verse_map = {v["full_reference"]: v for v in verses}
     entity_name_to_id: dict[str, int] = {}
@@ -263,6 +294,8 @@ def save_extraction_results(verses: list, result: dict) -> dict:
         verse = verse_map.get(vs_summary.get("reference", ""))
         if not verse:
             continue
+        
+        # Process entity mentions
         for mention in vs_summary.get("entities_mentioned", []):
             # Handle both old format (string) and new format (dict with name and source)
             if isinstance(mention, dict):
@@ -293,6 +326,15 @@ def save_extraction_results(verses: list, result: dict) -> dict:
             
             ai_link_verse_entity(verse["id"], entity_id, mention_source)
             stats["mentions_created"] += 1
+        
+        # Process concepts
+        concepts = vs_summary.get("concepts", [])
+        logger.info(f"concepts={concepts}")
+        logger.info(f"entities_mentioned={vs_summary.get("entities_mentioned", [])}")
+        if concepts:
+            concepts_count = ai_save_verse_concepts(verse["id"], concepts)
+            stats["concepts_created"] += concepts_count
+    logger.info(f"DONE")
 
     return stats
 
@@ -350,7 +392,7 @@ def process_verses(verses: list, dry_run: bool = False):
 
     processed = 0
     total_stats = {"entities_created": 0, "entities_reused": 0,
-                   "relationships_created": 0, "mentions_created": 0}
+                   "relationships_created": 0, "mentions_created": 0, "concepts_created": 0}
 
     for i in range(0, total, BATCH_SIZE):
         batch = verses[i:i + BATCH_SIZE]
@@ -407,7 +449,8 @@ def process_verses(verses: list, dry_run: bool = False):
             f"  Entities created: {total_stats['entities_created']}  "
             f"reused: {total_stats['entities_reused']}\n"
             f"  Relationships created: {total_stats['relationships_created']}\n"
-            f"  Verse-entity mentions: {total_stats['mentions_created']}"
+            f"  Verse-entity mentions: {total_stats['mentions_created']}\n"
+            f"  Concepts extracted: {total_stats['concepts_created']}"
         )
     return total_stats
 
@@ -453,3 +496,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
