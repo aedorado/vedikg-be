@@ -71,6 +71,34 @@ def list_ai_entities(
     conn.close()
     return result
 
+# New endpoint: List all concepts with associated verses and verse titles
+@router.get("/concepts")
+def list_ai_concepts(limit: int = 100000):
+    """List all unique concepts with the verses and verse titles where they appear."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT c.concept, array_agg(v.id) AS verse_ids, array_agg(v.full_reference) AS verse_titles
+        FROM ai_verse_concepts c
+        JOIN verses v ON v.id = c.verse_id
+        GROUP BY c.concept
+        ORDER BY COUNT(*) DESC
+        LIMIT %s
+        """,
+        (limit,)
+    )
+    rows = cursor.fetchall()
+    result = []
+    for r in rows:
+        result.append({
+            "concept": r[0],
+            "verse_ids": r[1],
+            "verse_titles": r[2],
+        })
+    cursor.close()
+    conn.close()
+    return result
 
 @router.get("/entities/{entity_id}")
 def get_ai_entity(entity_id: int):
