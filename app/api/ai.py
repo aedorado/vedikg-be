@@ -12,7 +12,7 @@ def list_ai_entities(
     search: str | None = None,
     limit: int = 500,
 ):
-    """List all AI-extracted entities with verse counts."""
+    """List all AI-extracted entities with verse counts and concepts."""
     conn = get_conn()
     cursor = conn.cursor()
     
@@ -52,22 +52,32 @@ def list_ai_entities(
     params.append(limit)
     cursor.execute(query, params)
     rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-
-    return [
-        {
-            "id": r[0],
+    
+    result = []
+    for r in rows:
+        entity_id = r[0]
+        # Fetch concepts for this entity
+        cursor.execute(
+            "SELECT DISTINCT concept FROM ai_verse_concepts WHERE verse_id IN (SELECT verse_id FROM ai_verse_entities WHERE entity_id = %s) LIMIT 10",
+            (entity_id,)
+        )
+        concepts = [row[0] for row in cursor.fetchall()]
+        
+        result.append({
+            "id": entity_id,
             "name": r[1],
             "sanskrit_name": r[2],
-            "type": r[3],
+            "entity_type": r[3],
             "description": r[4],
             "aliases": r[5],
             "mention_count": r[6],
             "verse_count": r[7],
-        }
-        for r in rows
-    ]
+            "concepts": concepts,
+        })
+    
+    cursor.close()
+    conn.close()
+    return result
 
 
 @router.get("/entities/{entity_id}")
@@ -113,6 +123,14 @@ def get_ai_entity(entity_id: int):
     """, (entity_id,))
     rels_in = cursor.fetchall()
 
+    # Fetch concepts associated with this entity's verses
+    cursor.execute("""
+        SELECT DISTINCT concept FROM ai_verse_concepts 
+        WHERE verse_id IN (SELECT verse_id FROM ai_verse_entities WHERE entity_id = %s)
+        LIMIT 20
+    """, (entity_id,))
+    concepts = [row[0] for row in cursor.fetchall()]
+
     cursor.close()
     conn.close()
 
@@ -124,6 +142,7 @@ def get_ai_entity(entity_id: int):
         "description": entity[3],
         "aliases": entity[4],
         "mention_count": entity[5],
+        "concepts": concepts,
         "verses": [{"reference": r[0], "devanagari": r[1], "transliteration": r[2], "translation": r[3], "mention_source": r[4]} for r in verses],
         "relationships_out": [{"target": r[0], "type": r[1], "context": r[2]} for r in rels_out],
         "relationships_in": [{"source": r[0], "type": r[1], "context": r[2]} for r in rels_in],
