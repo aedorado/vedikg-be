@@ -204,3 +204,13 @@ class ScrapeJob(Base):
     completed_at = Column(DateTime, nullable=True)
     last_processed_verse = Column(Integer, nullable=True)
     error_message = Column(Text, nullable=True)
+
+
+class VerseConcept(Base):
+    __tablename__ = "ai_verse_concepts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    verse_id = Column(Integer, ForeignKey("verses.id"), index=True)
+    concept = Column(String(255), index=True)  # e.g., "bhakti", "karma", "maya", "humility", "tolerance", "cleanliness"
+
+    verse = relationship("Verse", foreign_keys=[verse_id])
