@@ -59,10 +59,13 @@ Return ONLY a valid JSON object (no markdown, no extra text) with this exact str
           "name": "entity name",
           "source": "verse or purport"
         }
-      ]
+      ],
+      "concepts": ["concept1", "concept2", "concept3"]
     }
   ]
 }
+
+Concept Examples: devotion, sacrifice, dharma, renunciation, love, bhakti, karma, maya, prema, patience, anger, lust, cleanliness, humility, pride, tapasya, artha, kama, moksha, nonviolence, tolerance, Krishna's pastimes, creation etc.
 
 Rules:
 - Only extract entities clearly mentioned or unambiguously implied in the text
@@ -71,6 +74,7 @@ Rules:
 - Include well-known aliases (e.g. aliases of Krishna: ["Govinda","Madhusudana","Vasudeva"])
 - For relationships, only include those explicitly stated or strongly implied in the text
 - Track whether each entity is mentioned in the verse translation ("verse") or the purport explanation ("purport")
+- For concepts: extract all teachings, philosophical principles, virtues, vices, qualities, and themes explicitly discussed (no limit)
 - If nothing can be confidently extracted, return {"entities": [], "relationships": [], "verse_summaries": []}
 """
 
