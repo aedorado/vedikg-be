@@ -18,20 +18,11 @@ from sqlalchemy.orm import Session
 from app.db.base import SessionLocal
 from app.models.models import (
     Book, Author, Canto, Chapter, Verse, Purport,
-    Entity, VerseEntity, Relationship, ScrapeJob,
 )
-from app.nlp.alias_resolver import resolve_alias, ALIAS_TO_ENTITY
-from app.nlp.relationship_extractor import RelationshipExtractor
 from app.nlp.chanda_detector import detect_chanda, detect_chanda_detail, detect_language
-from app.scraper.vedabase import _infer_entity_type
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
-rel_extractor = RelationshipExtractor()
-
-# ── Entity type inference (reuse SB logic) ───────────────────────────────────
-from app.scraper.vedabase import _infer_entity_type
 
 # ── CC section metadata ───────────────────────────────────────────────────────
 CC_SECTIONS = {
@@ -217,103 +208,15 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> Optional[str]:
         return None
 
 
-# ── Entity/relationship processing (reuses SB logic) ──────────────────────────
-
-def _process_entities(db: Session, verse: Verse, translation: str, purport: str):
-    combined = (translation or "") + " " + (purport or "")
-    if not combined.strip():
-        return
-    try:
-        entity_names = rel_extractor.extract_all_entities(combined)
-        if entity_names:
-            logger.info(f"Verse {verse.id}: extracted {len(entity_names)} entities")
-        for entity_name in entity_names:
-            try:
-                entity = db.query(Entity).filter_by(normalized_name=entity_name.lower()).first()
-                # CREATE new entity if it doesn't exist (matching SB scraper behavior)
-                if not entity:
-                    entity = Entity(
-                        name=entity_name,
-                        normalized_name=entity_name.lower(),
-                        entity_type=_infer_entity_type(entity_name),
-                    )
-                    db.add(entity)
-                    db.flush()
-                    logger.info(f"Created entity: {entity_name}")
-                
-                # Find where the entity is mentioned
-                verse_mention = translation and entity_name.lower() in translation.lower()
-                purport_mention = purport and entity_name.lower() in purport.lower()
-                
-                if verse_mention or purport_mention:
-                    location = "both" if (verse_mention and purport_mention) else ("verse_text" if verse_mention else "purport_text")
-                    existing = db.query(VerseEntity).filter_by(
-                        verse_id=verse.id, entity_id=entity.id
-                    ).first()
-                    if not existing:
-                        db.add(VerseEntity(
-                            verse_id=verse.id, entity_id=entity.id,
-                            mention_location=location, confidence_score=0.9
-                        ))
-            except Exception as entity_err:
-                # Log per-entity errors but continue processing other entities
-                logger.warning(f"Failed to process entity '{entity_name}' for verse {verse.id}: {entity_err}")
-                db.rollback()
-                # Refetch the entity in case it exists but flush failed
-                entity = db.query(Entity).filter_by(normalized_name=entity_name.lower()).first()
-                if entity:
-                    verse_mention = translation and entity_name.lower() in translation.lower()
-                    purport_mention = purport and entity_name.lower() in purport.lower()
-                    if verse_mention or purport_mention:
-                        location = "both" if (verse_mention and purport_mention) else ("verse_text" if verse_mention else "purport_text")
-                        existing = db.query(VerseEntity).filter_by(
-                            verse_id=verse.id, entity_id=entity.id
-                        ).first()
-                        if not existing:
-                            db.add(VerseEntity(
-                                verse_id=verse.id, entity_id=entity.id,
-                                mention_location=location, confidence_score=0.9
-                            ))
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Entity extraction failed for verse {verse.id}: {e}", exc_info=True)
-
-
-
-def _process_relationships(db: Session, verse: Verse, text: str):
-    if not text:
-        return
-    try:
-        rels = rel_extractor.extract_relationships(text)
-        for src_name, rel_type, tgt_name in rels:
-            src = db.query(Entity).filter_by(name=resolve_alias(src_name) or src_name).first()
-            tgt = db.query(Entity).filter_by(name=resolve_alias(tgt_name) or tgt_name).first()
-            if src and tgt and src.id != tgt.id:
-                existing = db.query(Relationship).filter_by(
-                    source_entity_id=src.id, target_entity_id=tgt.id,
-                    relationship_type=rel_type, source_verse_id=verse.id
-                ).first()
-                if not existing:
-                    db.add(Relationship(
-                        source_entity_id=src.id, target_entity_id=tgt.id,
-                        relationship_type=rel_type, source_verse_id=verse.id,
-                        confidence_score=0.85
-                    ))
-    except Exception as e:
-        logger.debug(f"Relationship extraction failed for verse {verse.id}: {e}")
 
 
 # ── Main scrape logic ─────────────────────────────────────────────────────────
 
 async def scrape_cc_chapter(section_key: str, chapter_num: int, db: Session):
     url = f"{BASE_URL}/{section_key}/{chapter_num}/"
-    book = _get_or_create_book(db)
-    author = _get_prabhupada(db)
-    canto = _get_or_create_canto(db, book, section_key)
 
     async with httpx.AsyncClient() as client:
-        # Phase 1: fetch chapter index page for title, summary, verse links
+        # Phase 1: fetch chapter index for title, summary, verse links
         html = await _fetch(client, url)
         if not html:
             logger.error(f"Could not fetch {url}")
@@ -329,42 +232,62 @@ async def scrape_cc_chapter(section_key: str, chapter_num: int, db: Session):
             return 0
         logger.info(f"  Found {len(verse_links)} verses in CC {section_key} ch.{chapter_num}")
 
+        # Check which verses already exist (brief DB touch, then release)
+        book = _get_or_create_book(db)
+        author = _get_prabhupada(db)
+        canto = _get_or_create_canto(db, book, section_key)
         chapter = _get_or_create_chapter(db, canto, chapter_num, title, url)
         if summary and not chapter.summary:
             chapter.summary = summary
+        db.commit()
 
-        # Phase 2: fetch each individual verse page
+        existing_nums = {
+            row[0] for row in
+            db.query(Verse.verse_number).filter_by(chapter_id=chapter.id).all()
+        }
+        chapter_id = chapter.id
+        book_id = book.id
+        author_id = author.id
+        db.close()  # release connection before the long concurrent fetch
+
+        pending = [(vnum, vurl) for vnum, vurl in verse_links if vnum not in existing_nums]
+        if not pending:
+            logger.info(f"  All verses already scraped, skipping")
+            return 0
+
+        # Phase 2: fetch all pending verse pages concurrently (no DB held open)
+        htmls = await asyncio.gather(*[_fetch(client, vurl) for _, vurl in pending])
+
+    # Phase 3: parse in memory
+    from datetime import timezone
+    now = datetime.now(timezone.utc)
+    parsed = []
+    for (vnum, verse_url), verse_html in zip(pending, htmls):
+        if not verse_html:
+            logger.warning(f"  Could not fetch verse {vnum}: {verse_url}")
+            continue
+        vd = _parse_verse_page(verse_html, vnum, section_key, chapter_num, verse_url)
+        if not vd:
+            logger.warning(f"  Could not parse verse {vnum} from {verse_url}")
+            continue
+        lang = detect_language(vd.get("transliteration") or "")
+        chanda, chanda_json = None, None
+        if lang == "sa" and vd.get("transliteration"):
+            try:
+                chanda = detect_chanda(vd["transliteration"])
+                detail = detect_chanda_detail(vd["transliteration"])
+                chanda_json = json.dumps(detail, ensure_ascii=False) if detail else None
+            except Exception:
+                pass
+        parsed.append((vd, lang, chanda, chanda_json, verse_url))
+
+    # Phase 4: bulk insert with a fresh DB connection
+    db2 = SessionLocal()
+    try:
         count = 0
-        for vnum, verse_url in verse_links:
-            existing = db.query(Verse).filter_by(
-                chapter_id=chapter.id, verse_number=vnum
-            ).first()
-            if existing:
-                continue
-
-            verse_html = await _fetch(client, verse_url)
-            if not verse_html:
-                logger.warning(f"  Could not fetch verse {vnum}: {verse_url}")
-                continue
-
-            vd = _parse_verse_page(verse_html, vnum, section_key, chapter_num, verse_url)
-            if not vd:
-                logger.warning(f"  Could not parse verse {vnum} from {verse_url}")
-                continue
-
-            lang = detect_language(vd.get("transliteration") or "")
-
-            chanda, chanda_json = None, None
-            if lang == "sa" and vd.get("transliteration"):
-                try:
-                    chanda = detect_chanda(vd["transliteration"])
-                    detail = detect_chanda_detail(vd["transliteration"])
-                    chanda_json = json.dumps(detail, ensure_ascii=False) if detail else None
-                except Exception:
-                    pass
-
+        for vd, lang, chanda, chanda_json, verse_url in parsed:
             verse = Verse(
-                chapter_id=chapter.id,
+                chapter_id=chapter_id,
                 verse_number=vd["verse_number"],
                 full_reference=vd["full_reference"],
                 source_url=vd["source_url"],
@@ -377,42 +300,44 @@ async def scrape_cc_chapter(section_key: str, chapter_num: int, db: Session):
                 chanda=chanda,
                 chanda_json=chanda_json,
                 language=lang,
-                book_id=book.id,
-                scraped_at=datetime.utcnow(),
+                book_id=book_id,
+                scraped_at=now,
             )
-            db.add(verse)
-            db.flush()
-
+            db2.add(verse)
+            db2.flush()
             if vd.get("purport_text"):
-                db.add(Purport(
+                db2.add(Purport(
                     verse_id=verse.id,
-                    author_id=author.id,
+                    author_id=author_id,
                     body_html=vd.get("purport_html"),
                     body_text=vd.get("purport_text"),
                     language="en",
                 ))
-
-            _process_entities(db, verse, vd.get("translation"), vd.get("purport_text"))
-            _process_relationships(db, verse, (vd.get("translation") or "") + " " + (vd.get("purport_text") or ""))
-
             count += 1
-            logger.info(f"  Saved {vd['full_reference']}")
-
-        db.commit()
+        db2.commit()
         logger.info(f"CC {CC_SECTIONS[section_key]['label']} ch.{chapter_num}: {count} new verses")
         return count
-
-
-async def scrape_cc(section_key: str, chapters: list[int]):
-    db = SessionLocal()
-    try:
-        total = 0
-        for ch in chapters:
-            n = await scrape_cc_chapter(section_key, ch, db)
-            total += n
-        logger.info(f"Done. Total new verses: {total}")
+    except Exception:
+        db2.rollback()
+        raise
     finally:
-        db.close()
+        db2.close()
+
+
+async def scrape_cc(section_key: str, chapters: list[int], concurrency: int = 5):
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _scrape_with_sem(chapter_num: int):
+        async with sem:
+            db = SessionLocal()
+            try:
+                return await scrape_cc_chapter(section_key, chapter_num, db)
+            except Exception as e:
+                logger.error(f"Failed CC {section_key} ch.{chapter_num}: {e}")
+                return 0
+
+    results = await asyncio.gather(*[_scrape_with_sem(ch) for ch in chapters])
+    logger.info(f"Done. Total new verses: {sum(results)}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -421,7 +346,9 @@ def main():
     parser = argparse.ArgumentParser(description="Scrape Caitanya-caritāmṛta from vedabase.io")
     parser.add_argument("--section", choices=["adi", "madhya", "antya"], required=True)
     parser.add_argument("--chapters", default="all",
-                        help="'all', single number, or range like '1-5'")
+                        help="'all', single number, range '1-5', or list '1,3,5'")
+    parser.add_argument("--concurrency", type=int, default=5,
+                        help="Chapters to scrape in parallel (default: 5)")
     args = parser.parse_args()
 
     meta = CC_SECTIONS[args.section]
@@ -429,13 +356,17 @@ def main():
 
     if args.chapters == "all":
         chapters = list(range(1, max_ch + 1))
-    elif "-" in args.chapters:
-        a, b = args.chapters.split("-")
-        chapters = list(range(int(a), int(b) + 1))
     else:
-        chapters = [int(args.chapters)]
+        chapters = []
+        for part in args.chapters.split(","):
+            part = part.strip()
+            if "-" in part:
+                a, b = part.split("-", 1)
+                chapters.extend(range(int(a), int(b) + 1))
+            else:
+                chapters.append(int(part))
 
-    asyncio.run(scrape_cc(args.section, chapters))
+    asyncio.run(scrape_cc(args.section, chapters, concurrency=args.concurrency))
 
 
 if __name__ == "__main__":

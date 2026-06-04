@@ -3,9 +3,9 @@ import json as _json
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload, contains_eager
 from app.db.base import get_db
-from app.models.models import Verse, Chapter, Canto, Book, Purport, Author
+from app.models.models import Verse, Chapter, Canto, Book, Purport, Author, VerseEntity, Entity
 
 # CC section slug → display label
 CC_SECTIONS = {
@@ -54,6 +54,43 @@ def list_verses(skip: int = Query(0), limit: int = Query(20), db: Session = Depe
         ],
     }
 
+@router.get("/sb/chapters/{canto_num:int}")
+def list_sb_chapters(canto_num: int, db: Session = Depends(get_db)):
+    """GET /api/verses/sb/chapters/1  →  list of chapters in SB Canto 1"""
+    sb_book = db.query(Book).filter_by(code='SB').first()
+    if not sb_book:
+        raise HTTPException(404, "SB not scraped yet")
+    canto = db.query(Canto).filter_by(book_id=sb_book.id, number=canto_num).first()
+    if not canto:
+        raise HTTPException(404, f"SB Canto {canto_num} not found")
+
+    # Single query: join chapters with verse counts
+    from sqlalchemy import literal_column
+    result = db.query(
+        Chapter.id,
+        Chapter.chapter_number,
+        Chapter.title,
+        Chapter.summary,
+        func.count(Verse.id).label('verse_count')
+    ).outerjoin(Verse, Verse.chapter_id == Chapter.id).filter(
+        Chapter.canto_id == canto.id
+    ).group_by(
+        Chapter.id, Chapter.chapter_number, Chapter.title, Chapter.summary
+    ).order_by(
+        Chapter.chapter_number
+    ).all()
+
+    return [
+        {
+            "chapter_number": row[1],
+            "title": row[2],
+            "summary": row[3][:200] if row[3] else None,
+            "verse_count": row[4],
+        }
+        for row in result
+    ]
+
+
 @router.get("/sb/{slug:path}")
 def get_verse_by_slug(slug: str, db: Session = Depends(get_db)):
     """
@@ -67,8 +104,9 @@ def get_verse_by_slug(slug: str, db: Session = Depends(get_db)):
             canto_num, chapter_num = int(parts[0]), int(parts[1])
         except ValueError:
             return {"error": "Invalid chapter path"}
-        canto = db.query(Canto).filter_by(book_id=sb_book.id if sb_book else None, number=canto_num).first() \
-                or db.query(Canto).filter_by(number=canto_num).first()
+        if not sb_book:
+            return {"error": "SB not scraped yet"}
+        canto = db.query(Canto).filter_by(book_id=sb_book.id, number=canto_num).first()
         if not canto:
             return {"error": f"Canto {canto_num} not found"}
         chapter = db.query(Chapter).filter_by(canto_id=canto.id, chapter_number=chapter_num).first()
@@ -94,7 +132,12 @@ def get_verse_by_slug(slug: str, db: Session = Depends(get_db)):
             ],
         }
     full_reference = _slug_to_sb_reference(slug)
-    verse = db.query(Verse).filter(Verse.full_reference == full_reference).first()
+    verse = (
+        db.query(Verse)
+        .filter(Verse.full_reference == full_reference)
+        .options(selectinload(Verse.purports).selectinload(Purport.author), selectinload(Verse.entities).selectinload(VerseEntity.entity))
+        .first()
+    )
     if not verse:
         return {"error": f"Verse {full_reference} not found"}
     return _verse_response(verse, db)
@@ -119,12 +162,19 @@ def list_cc_chapters(section: str, db: Session = Depends(get_db)):
         .order_by(Chapter.chapter_number)
         .all()
     )
+    chapter_ids = [ch.id for ch in chapters]
+    counts = dict(
+        db.query(Verse.chapter_id, func.count(Verse.id))
+        .filter(Verse.chapter_id.in_(chapter_ids))
+        .group_by(Verse.chapter_id)
+        .all()
+    ) if chapter_ids else {}
     return [
         {
             "chapter_number": ch.chapter_number,
             "title": ch.title,
             "summary": ch.summary[:300] if ch.summary else None,
-            "verse_count": db.query(Verse).filter_by(chapter_id=ch.id).count(),
+            "verse_count": counts.get(ch.id, 0),
         }
         for ch in chapters
     ]
@@ -149,6 +199,10 @@ def get_cc_chapter(section: str, chapter_num: int, db: Session = Depends(get_db)
     verses = (
         db.query(Verse)
         .filter_by(chapter_id=chapter.id)
+        .options(
+            selectinload(Verse.purports).selectinload(Purport.author),
+            selectinload(Verse.entities).selectinload(VerseEntity.entity),
+        )
         .order_by(Verse.verse_number)
         .all()
     )
@@ -158,7 +212,7 @@ def get_cc_chapter(section: str, chapter_num: int, db: Session = Depends(get_db)
         "chapter_number": chapter_num,
         "title": chapter.title,
         "summary": chapter.summary,
-        "verses": [_verse_response(v, db) for v in verses],
+        "verses": [_verse_response_no_nav(v) for v in verses],
     }
 
 
@@ -178,9 +232,127 @@ def get_cc_verse(section: str, chapter_num: int, verse_num: int, db: Session = D
     chapter = db.query(Chapter).filter_by(canto_id=canto.id, chapter_number=chapter_num).first()
     if not chapter:
         raise HTTPException(404, f"CC {section_label} chapter {chapter_num} not found")
-    verse = db.query(Verse).filter_by(chapter_id=chapter.id, verse_number=verse_num).first()
+    verse = (
+        db.query(Verse)
+        .filter_by(chapter_id=chapter.id, verse_number=verse_num)
+        .options(selectinload(Verse.purports).selectinload(Purport.author), selectinload(Verse.entities).selectinload(VerseEntity.entity))
+        .first()
+    )
     if not verse:
         raise HTTPException(404, f"CC {section_label} {chapter_num}.{verse_num} not found")
+    return _verse_response(verse, db)
+
+
+# BRS (Bhakti-rasāmṛta-sindhu) endpoints
+BRS_SECTIONS = {
+    "eastern":  (1, "Eastern Section: Types of Bhakti"),
+    "southern": (2, "Southern Section: Components of Rasa"),
+    "western":  (3, "Western Section: Primary Bhakti Rasas"),
+    "northern": (4, "Northern Section: Secondary Bhakti Rasas"),
+}
+
+@router.get("/brs/{section}")
+def list_brs_waves(section: str, db: Session = Depends(get_db)):
+    """GET /api/verses/brs/eastern  →  list of waves (chapters) with verse counts"""
+    section = section.lower()
+    if section not in BRS_SECTIONS:
+        raise HTTPException(404, f"Unknown BRS section '{section}'. Use: eastern, southern, western, northern")
+    section_number, section_label = BRS_SECTIONS[section]
+    brs_book = db.query(Book).filter_by(code='BRS').first()
+    if not brs_book:
+        raise HTTPException(404, "BRS not scraped yet")
+    canto = db.query(Canto).filter_by(book_id=brs_book.id, number=section_number).first()
+    if not canto:
+        return []
+    chapters = (
+        db.query(Chapter)
+        .filter_by(canto_id=canto.id)
+        .order_by(Chapter.chapter_number)
+        .all()
+    )
+    chapter_ids = [ch.id for ch in chapters]
+    counts = dict(
+        db.query(Verse.chapter_id, func.count(Verse.id))
+        .filter(Verse.chapter_id.in_(chapter_ids))
+        .group_by(Verse.chapter_id)
+        .all()
+    ) if chapter_ids else {}
+    return [
+        {
+            "wave_number": ch.chapter_number,
+            "title": ch.title,
+            "verse_count": counts.get(ch.id, 0),
+        }
+        for ch in chapters
+    ]
+
+
+@router.get("/brs/{section}/{wave_num:int}")
+def get_brs_wave(section: str, wave_num: int, db: Session = Depends(get_db)):
+    """GET /api/verses/brs/eastern/1  →  all verses in Eastern Wave 1"""
+    section = section.lower()
+    if section not in BRS_SECTIONS:
+        raise HTTPException(404, f"Unknown BRS section '{section}'")
+    section_number, section_label = BRS_SECTIONS[section]
+    brs_book = db.query(Book).filter_by(code='BRS').first()
+    if not brs_book:
+        raise HTTPException(404, "BRS not scraped yet")
+    canto = db.query(Canto).filter_by(book_id=brs_book.id, number=section_number).first()
+    if not canto:
+        raise HTTPException(404, f"BRS {section_label} not scraped yet")
+    chapter = db.query(Chapter).filter_by(canto_id=canto.id, chapter_number=wave_num).first()
+    if not chapter:
+        raise HTTPException(404, f"BRS {section_label} Wave {wave_num} not found")
+    # Skip purport loading for the wave listing — only need verse text
+    verses = (
+        db.query(Verse)
+        .filter_by(chapter_id=chapter.id)
+        .order_by(Verse.verse_number)
+        .all()
+    )
+    return {
+        "section": section,
+        "section_label": section_label,
+        "wave_number": wave_num,
+        "title": chapter.title,
+        # Minimal payload — full verse fetched individually on /brs/section/wave/verse
+        "verses": [
+            {
+                "id": v.id,
+                "full_reference": v.full_reference,
+                "verse_number": v.verse_number,
+                "transliteration": v.transliteration,
+                "translation": (v.translation or "")[:200],
+            }
+            for v in verses
+        ],
+    }
+
+
+@router.get("/brs/{section}/{wave_num:int}/{verse_num:int}")
+def get_brs_verse(section: str, wave_num: int, verse_num: int, db: Session = Depends(get_db)):
+    """GET /api/verses/brs/eastern/1/3  →  BRS 1.1.3"""
+    section = section.lower()
+    if section not in BRS_SECTIONS:
+        raise HTTPException(404, f"Unknown BRS section '{section}'")
+    section_number, section_label = BRS_SECTIONS[section]
+    brs_book = db.query(Book).filter_by(code='BRS').first()
+    if not brs_book:
+        raise HTTPException(404, "BRS not scraped yet")
+    canto = db.query(Canto).filter_by(book_id=brs_book.id, number=section_number).first()
+    if not canto:
+        raise HTTPException(404, f"BRS {section_label} not scraped yet")
+    chapter = db.query(Chapter).filter_by(canto_id=canto.id, chapter_number=wave_num).first()
+    if not chapter:
+        raise HTTPException(404, f"BRS {section_label} Wave {wave_num} not found")
+    verse = (
+        db.query(Verse)
+        .filter_by(chapter_id=chapter.id, verse_number=verse_num)
+        .options(selectinload(Verse.purports).selectinload(Purport.author))
+        .first()
+    )
+    if not verse:
+        raise HTTPException(404, f"BRS {section_number}.{wave_num}.{verse_num} not found")
     return _verse_response(verse, db)
 
 
@@ -210,12 +382,19 @@ def list_cb_chapters(khanda: str, db: Session = Depends(get_db)):
         .order_by(Chapter.chapter_number)
         .all()
     )
+    chapter_ids = [ch.id for ch in chapters]
+    counts = dict(
+        db.query(Verse.chapter_id, func.count(Verse.id))
+        .filter(Verse.chapter_id.in_(chapter_ids))
+        .group_by(Verse.chapter_id)
+        .all()
+    ) if chapter_ids else {}
     return [
         {
             "chapter_number": ch.chapter_number,
             "title": ch.title,
             "summary": ch.summary[:300] if ch.summary else None,
-            "verse_count": db.query(Verse).filter_by(chapter_id=ch.id).count(),
+            "verse_count": counts.get(ch.id, 0),
         }
         for ch in chapters
     ]
@@ -240,6 +419,10 @@ def get_cb_chapter(khanda: str, chapter_num: int, db: Session = Depends(get_db))
     verses = (
         db.query(Verse)
         .filter_by(chapter_id=chapter.id)
+        .options(
+            selectinload(Verse.purports).selectinload(Purport.author),
+            selectinload(Verse.entities).selectinload(VerseEntity.entity),
+        )
         .order_by(Verse.verse_number)
         .all()
     )
@@ -249,7 +432,7 @@ def get_cb_chapter(khanda: str, chapter_num: int, db: Session = Depends(get_db))
         "chapter_number": chapter_num,
         "title": chapter.title,
         "summary": chapter.summary,
-        "verses": [_verse_response(v, db) for v in verses],
+        "verses": [_verse_response_no_nav(v) for v in verses],
     }
 
 
@@ -269,34 +452,31 @@ def get_cb_verse(khanda: str, chapter_num: int, verse_num: int, db: Session = De
     chapter = db.query(Chapter).filter_by(canto_id=canto.id, chapter_number=chapter_num).first()
     if not chapter:
         raise HTTPException(404, f"CB {khanda_label} chapter {chapter_num} not found")
-    verse = db.query(Verse).filter_by(chapter_id=chapter.id, verse_number=verse_num).first()
+    verse = (
+        db.query(Verse)
+        .filter_by(chapter_id=chapter.id, verse_number=verse_num)
+        .options(selectinload(Verse.purports).selectinload(Purport.author), selectinload(Verse.entities).selectinload(VerseEntity.entity))
+        .first()
+    )
     if not verse:
         raise HTTPException(404, f"CB {khanda_label} {chapter_num}.{verse_num} not found")
     return _verse_response(verse, db)
 
 @router.get("/{verse_id}")
 def get_verse(verse_id: int, db: Session = Depends(get_db)):
-    verse = db.query(Verse).filter_by(id=verse_id).first()
+    verse = (
+        db.query(Verse)
+        .filter_by(id=verse_id)
+        .options(selectinload(Verse.purports).selectinload(Purport.author), selectinload(Verse.entities).selectinload(VerseEntity.entity))
+        .first()
+    )
     if not verse:
         return {"error": "Verse not found"}
     return _verse_response(verse, db)
 
 
-def _verse_response(verse: Verse, db: Session):
-    prev_verse = (
-        db.query(Verse)
-        .filter(Verse.id < verse.id)
-        .order_by(Verse.id.desc())
-        .first()
-    )
-    next_verse = (
-        db.query(Verse)
-        .filter(Verse.id > verse.id)
-        .order_by(Verse.id.asc())
-        .first()
-    )
-    # Purports with author info
-    purport_data = [
+def _purport_data(verse: Verse):
+    return [
         {
             "author": p.author.name if p.author else "Unknown",
             "author_slug": p.author.slug if p.author else None,
@@ -306,6 +486,18 @@ def _verse_response(verse: Verse, db: Session):
         }
         for p in verse.purports
     ]
+
+
+def _verse_core(verse: Verse):
+    """Fields shared by both response helpers."""
+    # For BRS verses, synonyms_raw holds the footnote map JSON
+    footnotes = None
+    if verse.full_reference and verse.full_reference.startswith("BRS ") and verse.synonyms_raw:
+        try:
+            footnotes = _json.loads(verse.synonyms_raw)
+        except Exception:
+            pass
+
     return {
         "id": verse.id,
         "full_reference": verse.full_reference,
@@ -316,23 +508,57 @@ def _verse_response(verse: Verse, db: Session):
         "devanagari": verse.devanagari,
         "transliteration": verse.transliteration,
         "translation": verse.translation,
-        "synonyms_raw": verse.synonyms_raw,
-        # Legacy fields kept for backward compat
+        "synonyms_raw": verse.synonyms_raw if not footnotes else None,
+        "footnotes": footnotes,  # {number → text} for BRS, null for other books
         "purport_text": verse.purport_text,
         "purport_html": verse.purport_html,
-        # New structured purports
-        "purports": purport_data,
+        "purports": _purport_data(verse),
         "chanda": verse.chanda,
         "chanda_detail": _json.loads(verse.chanda_json) if verse.chanda_json else None,
         "entities": [
-            {"id": ve.entity.id, "name": ve.entity.name, "mention_location": ve.mention_location}
+            {"id": ve.entity.id, "name": ve.entity.name, "mention_source": ve.mention_source}
             for ve in verse.entities
         ],
+    }
+
+
+def _verse_response_no_nav(verse: Verse):
+    """Used when rendering a full chapter — skips prev/next nav queries."""
+    return _verse_core(verse)
+
+
+def _verse_response(verse: Verse, db: Session):
+    # Use stored FK pointers when available; fall back to id-range queries
+    prev_verse = None
+    next_verse = None
+    if verse.previous_verse_id:
+        prev_verse = db.query(Verse.full_reference).filter_by(id=verse.previous_verse_id).scalar()
+        prev_verse = type("_V", (), {"full_reference": prev_verse})() if prev_verse else None
+    else:
+        prev_verse = (
+            db.query(Verse)
+            .filter(Verse.id < verse.id)
+            .order_by(Verse.id.desc())
+            .first()
+        )
+    if verse.next_verse_id:
+        next_ref = db.query(Verse.full_reference).filter_by(id=verse.next_verse_id).scalar()
+        next_verse = type("_V", (), {"full_reference": next_ref})() if next_ref else None
+    else:
+        next_verse = (
+            db.query(Verse)
+            .filter(Verse.id > verse.id)
+            .order_by(Verse.id.asc())
+            .first()
+        )
+    data = _verse_core(verse)
+    data.update({
         "prev_slug": _reference_to_slug(prev_verse.full_reference) if prev_verse else None,
         "next_slug": _reference_to_slug(next_verse.full_reference) if next_verse else None,
         "prev_reference": prev_verse.full_reference if prev_verse else None,
         "next_reference": next_verse.full_reference if next_verse else None,
-    }
+    })
+    return data
 
 @router.get("/chapter/{chapter_id}")
 def get_chapter_verses(chapter_id: int, db: Session = Depends(get_db)):

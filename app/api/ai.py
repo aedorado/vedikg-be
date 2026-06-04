@@ -1,23 +1,36 @@
 """API endpoints for AI-extracted entities and relationships."""
 
+import json as _json
 from fastapi import APIRouter, HTTPException
 from db import get_conn
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
 
+FAMILY_RELS = {
+    "father_of", "mother_of", "son_of", "daughter_of",
+    "brother_of", "sister_of", "spouse_of",
+    "uncle_of", "nephew_of", "cousin_of",
+    "grandfather_of", "grandson_of",
+}
 
-@router.get("/entities")
-def list_ai_entities(
+
+@router.get("/personalities")
+def list_ai_personalities(
     type: str | None = None,
     search: str | None = None,
-    limit: int = 500,
+    book: str | None = None,
+    canto: int | None = None,
+    chapter: int | None = None,
+    limit: int = 50,
+    offset: int = 0,
 ):
-    """List all AI-extracted entities with verse counts and concepts."""
+    """List personalities/entities excluding concepts."""
     conn = get_conn()
     cursor = conn.cursor()
-    
-    where_clauses = []
+
+    where_clauses = ["e.entity_type != 'concept'"]
     params = []
+    join_clauses = ""
 
     if type:
         types = [t.strip() for t in type.split(",")]
@@ -26,50 +39,165 @@ def list_ai_entities(
         params.extend(types)
 
     if search:
-        where_clauses.append("LOWER(e.name) LIKE %s")
-        params.append(f"%{search.lower()}%")
+        where_clauses.append(
+            "(LOWER(e.name) LIKE %s OR LOWER(e.sanskrit_name) LIKE %s OR LOWER(e.aliases_json) LIKE %s)"
+        )
+        pattern = f"%{search.lower()}%"
+        params.extend([pattern, pattern, pattern])
 
-    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    # Book/canto/chapter filtering
+    if book or canto or chapter:
+        join_clauses += """
+            JOIN verses v ON v.id = ave.verse_id
+            JOIN chapters ch ON ch.id = v.chapter_id
+            JOIN cantos ca ON ca.id = ch.canto_id
+            JOIN books b ON b.id = ca.book_id
+        """
+        if book:
+            where_clauses.append("UPPER(b.code) = %s")
+            params.append(book.upper())
+        if canto is not None:
+            where_clauses.append("ca.number = %s")
+            params.append(canto)
+        if chapter is not None:
+            where_clauses.append("ch.chapter_number = %s")
+            params.append(chapter)
 
-    query = f"""
+    where_sql = f"WHERE {' AND '.join(where_clauses)}"
+
+    cursor.execute(f"""
         SELECT
-            e.id,
-            e.name,
-            e.sanskrit_name,
-            e.entity_type,
-            e.description,
-            e.aliases_json,
-            e.mention_count,
+            e.id, e.name, e.sanskrit_name, e.entity_type,
+            e.description, e.aliases_json, e.mention_count,
             COUNT(DISTINCT ave.verse_id) AS verse_count
         FROM ai_entities e
         LEFT JOIN ai_verse_entities ave ON ave.entity_id = e.id
+        {join_clauses}
         {where_sql}
         GROUP BY e.id
         ORDER BY verse_count DESC, e.mention_count DESC
-        LIMIT %s
-    """
-    
-    params.append(limit)
-    cursor.execute(query, params)
+        LIMIT %s OFFSET %s
+    """, params + [limit, offset])
     rows = cursor.fetchall()
-    
-    result = []
-    for r in rows:
-        result.append({
-            "id": r[0],
-            "name": r[1],
-            "sanskrit_name": r[2],
-            "entity_type": r[3],
-            "description": r[4],
-            "aliases": r[5],
-            "mention_count": r[6],
-            "verse_count": r[7],
-            "concepts": [],
-        })
-    
+
+    # total count (same filters, no limit)
+    cursor.execute(f"""
+        SELECT COUNT(DISTINCT e.id)
+        FROM ai_entities e
+        LEFT JOIN ai_verse_entities ave ON ave.entity_id = e.id
+        {join_clauses}
+        {where_sql}
+    """, params)
+    total = cursor.fetchone()[0]
+
     cursor.close()
     conn.close()
-    return result
+
+    result = []
+    for r in rows:
+        try:
+            aliases = _json.loads(r[5] or "[]")
+        except Exception:
+            aliases = []
+        result.append({
+            "id": r[0], "name": r[1], "sanskrit_name": r[2],
+            "entity_type": r[3], "description": r[4],
+            "aliases": aliases, "mention_count": r[6], "verse_count": r[7],
+        })
+    return {"items": result, "total": total, "offset": offset, "limit": limit}
+
+
+@router.get("/entities")
+def list_ai_entities(
+    type: str | None = None,
+    search: str | None = None,
+    book: str | None = None,
+    canto: int | None = None,
+    chapter: int | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    where_clauses = []
+    params = []
+    join_clauses = ""
+
+    if type:
+        types = [t.strip() for t in type.split(",")]
+        placeholders = ",".join(["%s"] * len(types))
+        where_clauses.append(f"e.entity_type IN ({placeholders})")
+        params.extend(types)
+
+    if search:
+        where_clauses.append(
+            "(LOWER(e.name) LIKE %s OR LOWER(e.sanskrit_name) LIKE %s OR LOWER(e.aliases_json) LIKE %s)"
+        )
+        pattern = f"%{search.lower()}%"
+        params.extend([pattern, pattern, pattern])
+
+    # Book/canto/chapter filtering
+    if book or canto or chapter:
+        join_clauses += """
+            JOIN verses v ON v.id = ave.verse_id
+            JOIN chapters ch ON ch.id = v.chapter_id
+            JOIN cantos ca ON ca.id = ch.canto_id
+            JOIN books b ON b.id = ca.book_id
+        """
+        if book:
+            where_clauses.append("UPPER(b.code) = %s")
+            params.append(book.upper())
+        if canto is not None:
+            where_clauses.append("ca.number = %s")
+            params.append(canto)
+        if chapter is not None:
+            where_clauses.append("ch.chapter_number = %s")
+            params.append(chapter)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    cursor.execute(f"""
+        SELECT
+            e.id, e.name, e.sanskrit_name, e.entity_type,
+            e.description, e.aliases_json, e.mention_count,
+            COUNT(DISTINCT ave.verse_id) AS verse_count
+        FROM ai_entities e
+        LEFT JOIN ai_verse_entities ave ON ave.entity_id = e.id
+        {join_clauses}
+        {where_sql}
+        GROUP BY e.id
+        ORDER BY verse_count DESC, e.mention_count DESC
+        LIMIT %s OFFSET %s
+    """, params + [limit, offset])
+    rows = cursor.fetchall()
+
+    # total count (same filters, no limit)
+    count_where = where_sql.replace("ave.verse_id", "ave2.verse_id") if join_clauses else where_sql
+    cursor.execute(f"""
+        SELECT COUNT(DISTINCT e.id)
+        FROM ai_entities e
+        LEFT JOIN ai_verse_entities ave ON ave.entity_id = e.id
+        {join_clauses}
+        {where_sql}
+    """, params)
+    total = cursor.fetchone()[0]
+
+    cursor.close()
+    conn.close()
+
+    result = []
+    for r in rows:
+        try:
+            aliases = _json.loads(r[5] or "[]")
+        except Exception:
+            aliases = []
+        result.append({
+            "id": r[0], "name": r[1], "sanskrit_name": r[2],
+            "entity_type": r[3], "description": r[4],
+            "aliases": aliases, "mention_count": r[6], "verse_count": r[7],
+        })
+    return {"items": result, "total": total, "offset": offset, "limit": limit}
 
 # New endpoint: List all concepts with associated verses and verse titles
 @router.get("/concepts")
@@ -102,88 +230,206 @@ def list_ai_concepts(limit: int = 100000):
 
 @router.get("/entities/{entity_id}")
 def get_ai_entity(entity_id: int):
-    """Get a single AI entity with its verse mentions and relationships."""
+    """Full entity profile: metadata, verses with purport, relationships, concepts."""
     conn = get_conn()
     cursor = conn.cursor()
-    
+
     cursor.execute(
-        "SELECT id, name, entity_type, description, aliases_json, mention_count, sanskrit_name FROM ai_entities WHERE id=%s",
-        (entity_id,)
+        """SELECT id, name, entity_type, description, aliases_json,
+                  mention_count, sanskrit_name
+           FROM ai_entities WHERE id=%s""",
+        (entity_id,),
     )
     entity = cursor.fetchone()
-    
     if not entity:
         cursor.close()
         conn.close()
         raise HTTPException(status_code=404, detail="Entity not found")
 
     cursor.execute("""
-        SELECT v.full_reference, v.devanagari, v.transliteration, v.translation, ave.mention_source
+        SELECT v.id, v.full_reference, v.devanagari, v.transliteration,
+               v.translation, v.purport_text, ave.mention_source
         FROM ai_verse_entities ave
         JOIN verses v ON v.id = ave.verse_id
         WHERE ave.entity_id = %s
         ORDER BY v.id
-        LIMIT 100
+        LIMIT 500
     """, (entity_id,))
-    verses = cursor.fetchall()
+    verse_rows = cursor.fetchall()
 
     cursor.execute("""
-        SELECT e.sanskrit_name, r.relationship_type, r.context
+        SELECT e.id, e.name, e.sanskrit_name, e.entity_type,
+               r.relationship_type, r.context
         FROM ai_relationships r
         JOIN ai_entities e ON e.id = r.target_entity_id
         WHERE r.source_entity_id = %s
+        ORDER BY r.relationship_type, e.name
     """, (entity_id,))
     rels_out = cursor.fetchall()
 
     cursor.execute("""
-        SELECT e.sanskrit_name, r.relationship_type, r.context
+        SELECT e.id, e.name, e.sanskrit_name, e.entity_type,
+               r.relationship_type, r.context
         FROM ai_relationships r
         JOIN ai_entities e ON e.id = r.source_entity_id
         WHERE r.target_entity_id = %s
+        ORDER BY r.relationship_type, e.name
     """, (entity_id,))
     rels_in = cursor.fetchall()
 
-    # Fetch concepts associated with this entity's verses
     cursor.execute("""
-        SELECT DISTINCT concept FROM ai_verse_concepts 
-        WHERE verse_id IN (SELECT verse_id FROM ai_verse_entities WHERE entity_id = %s)
-        LIMIT 20
+        SELECT concept, COUNT(*) as freq
+        FROM ai_verse_concepts
+        WHERE verse_id IN (
+            SELECT verse_id FROM ai_verse_entities WHERE entity_id = %s
+        )
+        GROUP BY concept
+        ORDER BY freq DESC
+        LIMIT 40
     """, (entity_id,))
-    concepts = [row[0] for row in cursor.fetchall()]
+    concepts = [{"concept": r[0], "count": r[1]} for r in cursor.fetchall()]
 
     cursor.close()
     conn.close()
 
+    try:
+        aliases = _json.loads(entity[4] or "[]")
+    except Exception:
+        aliases = []
+
+    def fmt_rel(r, direction: str):
+        return {
+            "entity_id": r[0], "name": r[1], "sanskrit_name": r[2],
+            "entity_type": r[3], "type": r[4], "context": r[5],
+            "direction": direction,
+        }
+
     return {
         "id": entity[0],
         "name": entity[1],
-        "sanskrit_name": entity[6],
-        "type": entity[2],
+        "entity_type": entity[2],
         "description": entity[3],
-        "aliases": entity[4],
+        "aliases": aliases,
         "mention_count": entity[5],
+        "sanskrit_name": entity[6],
         "concepts": concepts,
-        "verses": [{"reference": r[0], "devanagari": r[1], "transliteration": r[2], "translation": r[3], "mention_source": r[4]} for r in verses],
-        "relationships_out": [{"target": r[0], "type": r[1], "context": r[2]} for r in rels_out],
-        "relationships_in": [{"source": r[0], "type": r[1], "context": r[2]} for r in rels_in],
+        "verses": [
+            {
+                "id": r[0],
+                "reference": r[1],
+                "devanagari": r[2],
+                "transliteration": r[3],
+                "translation": r[4],
+                "purport_excerpt": (r[5] or "")[:800],
+                "mention_source": r[6],
+            }
+            for r in verse_rows
+        ],
+        "family_relationships": (
+            [fmt_rel(r, "out") for r in rels_out if r[4] in FAMILY_RELS] +
+            [fmt_rel(r, "in")  for r in rels_in  if r[4] in FAMILY_RELS]
+        ),
+        "other_relationships": (
+            [fmt_rel(r, "out") for r in rels_out if r[4] not in FAMILY_RELS] +
+            [fmt_rel(r, "in")  for r in rels_in  if r[4] not in FAMILY_RELS]
+        ),
+    }
+
+
+@router.get("/concepts")
+def list_ai_concepts(search: str | None = None, limit: int = 50, offset: int = 0):
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    search_clause = "WHERE LOWER(c.concept) LIKE %s" if search else ""
+    search_params = [f"%{search.lower()}%"] if search else []
+
+    cursor.execute(f"""
+        SELECT c.concept,
+               COUNT(*) AS verse_count,
+               e.id AS entity_id,
+               e.description
+        FROM ai_verse_concepts c
+        LEFT JOIN ai_entities e
+          ON LOWER(e.name) = LOWER(c.concept) AND e.entity_type = 'concept'
+        {search_clause}
+        GROUP BY c.concept, e.id, e.description
+        ORDER BY verse_count DESC
+        LIMIT %s OFFSET %s
+    """, search_params + [limit, offset])
+    rows = cursor.fetchall()
+
+    cursor.execute(f"""
+        SELECT COUNT(DISTINCT c.concept) FROM ai_verse_concepts c {search_clause}
+    """, search_params)
+    total = cursor.fetchone()[0]
+
+    cursor.close()
+    conn.close()
+    return {
+        "items": [
+            {
+                "concept": r[0],
+                "verse_count": r[1],
+                "entity_id": r[2],
+                "description": r[3],
+            }
+            for r in rows
+        ],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }
+
+
+@router.get("/concepts/{slug}")
+def get_ai_concept(slug: str):
+    from urllib.parse import unquote
+    concept_name = unquote(slug)
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT c.concept,
+               array_agg(v.id ORDER BY v.id)               AS verse_ids,
+               array_agg(v.full_reference ORDER BY v.id)    AS verse_refs,
+               array_agg(v.translation ORDER BY v.id)       AS translations,
+               e.id AS entity_id,
+               e.description
+        FROM ai_verse_concepts c
+        JOIN verses v ON v.id = c.verse_id
+        LEFT JOIN ai_entities e
+          ON LOWER(e.name) = LOWER(c.concept) AND e.entity_type = 'concept'
+        WHERE LOWER(c.concept) = LOWER(%s)
+        GROUP BY c.concept, e.id, e.description
+    """, (concept_name,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if not row:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Concept not found")
+
+    return {
+        "concept": row[0],
+        "verse_ids": row[1],
+        "verse_titles": row[2],
+        "translations": row[3],
+        "entity_id": row[4],
+        "description": row[5],
     }
 
 
 @router.get("/relationships")
 def list_ai_relationships(limit: int = 1000):
-    """List all AI-extracted relationships."""
     conn = get_conn()
     cursor = conn.cursor()
-    
     cursor.execute("""
-        SELECT
-            r.id,
-            s.name AS source,
-            t.name AS target,
-            r.relationship_type,
-            r.context,
-            s.entity_type AS source_type,
-            t.entity_type AS target_type
+        SELECT r.id,
+               s.id, s.name, s.sanskrit_name, s.entity_type,
+               t.id, t.name, t.sanskrit_name, t.entity_type,
+               r.relationship_type, r.context
         FROM ai_relationships r
         JOIN ai_entities s ON s.id = r.source_entity_id
         JOIN ai_entities t ON t.id = r.target_entity_id
@@ -193,119 +439,93 @@ def list_ai_relationships(limit: int = 1000):
     rows = cursor.fetchall()
     cursor.close()
     conn.close()
-
-    # Normalize relationships that are stored backward
-    inversions = {
-        "expansion_of": "expands_as",
-        "killed_by": "kills",
-    }
-    
-    result = []
-    for r in rows:
-        source, target, rel_type = r[1], r[2], r[3]
-        
-        # If relationship type should be inverted, swap source/target
-        if rel_type in inversions:
-            result.append({
-                "id": r[0],
-                "source": target,
-                "target": source,
-                "type": inversions[rel_type],
-                "context": r[4],
-                "source_type": r[6],
-                "target_type": r[5],
-            })
-        else:
-            result.append({
-                "id": r[0],
-                "source": source,
-                "target": target,
-                "type": rel_type,
-                "context": r[4],
-                "source_type": r[5],
-                "target_type": r[6],
-            })
-
-    return result
+    return [
+        {
+            "id": r[0],
+            "source_id": r[1], "source": r[2], "source_sanskrit": r[3], "source_type": r[4],
+            "target_id": r[5], "target": r[6], "target_sanskrit": r[7], "target_type": r[8],
+            "type": r[9], "context": r[10],
+        }
+        for r in rows
+    ]
 
 
 @router.get("/graph")
 def ai_graph():
-    """Return nodes + edges for a force graph (familial relationships only)."""
-    # Familial relationship types to include
-    FAMILIAL_RELS = {
-        "son_of", "daughter_of", "father_of", "mother_of",
-        "brother_of", "sister_of", "spouse_of", "cousin_of",
-        "uncle_of", "aunt_of", "nephew_of", "niece_of",
-        "grandfather_of", "grandmother_of", "grandson_of", "granddaughter_of",
-        "parent_of", "child_of", "sibling_of"
-    }
-    
     conn = get_conn()
     cursor = conn.cursor()
-    
-    # Get top entities by verse count
-    cursor.execute("""
-        SELECT e.id, e.name, e.entity_type,
-               COUNT(DISTINCT ave.verse_id) AS verse_count
-        FROM ai_entities e
-        LEFT JOIN ai_verse_entities ave ON ave.entity_id = e.id
-        GROUP BY e.id
-        ORDER BY verse_count DESC
-        LIMIT 300
-    """)
-    nodes_rows = cursor.fetchall()
 
-    node_ids = {r[0] for r in nodes_rows}
-
-    # Get only familial relationships between top entities
+    # Get all familial relationships first
     cursor.execute("""
         SELECT source_entity_id, target_entity_id, relationship_type
         FROM ai_relationships
-        WHERE LOWER(relationship_type) IN ({})
-    """.format(",".join(["%s"] * len(FAMILIAL_RELS))), list(FAMILIAL_RELS))
+        WHERE relationship_type = ANY(%s)
+    """, (list(FAMILY_RELS),))
     edges_rows = cursor.fetchall()
 
+    # Collect all entity IDs that appear in familial relationships
+    entity_ids = set()
+    for r in edges_rows:
+        entity_ids.add(r[0])
+        entity_ids.add(r[1])
+
+    if not entity_ids:
+        return {"nodes": [], "edges": []}
+
+    # Now fetch all those entities (any type: person, deva, sage, demon, etc.)
+    placeholders = ",".join(["%s"] * len(entity_ids))
+    cursor.execute(f"""
+        SELECT e.id, e.name, e.sanskrit_name, e.entity_type,
+               COUNT(DISTINCT ave.verse_id) AS verse_count
+        FROM ai_entities e
+        LEFT JOIN ai_verse_entities ave ON ave.entity_id = e.id
+        WHERE e.id IN ({placeholders})
+        GROUP BY e.id
+        ORDER BY verse_count DESC
+    """, list(entity_ids))
+    nodes_rows = cursor.fetchall()
     cursor.close()
     conn.close()
 
     return {
-        "nodes": [{"id": r[0], "name": r[1], "type": r[2], "verse_count": r[3]} for r in nodes_rows],
+        "nodes": [
+            {"id": r[0], "name": r[1], "sanskrit_name": r[2], "type": r[3], "verse_count": r[4]}
+            for r in nodes_rows
+        ],
         "edges": [
             {"source": r[0], "target": r[1], "type": r[2]}
             for r in edges_rows
-            if r[0] in node_ids and r[1] in node_ids
         ],
     }
 
 
 @router.get("/progress")
 def ai_progress():
-    """Extraction progress: how many verses processed per book/canto."""
     conn = get_conn()
     cursor = conn.cursor()
-    
+
     cursor.execute("SELECT COUNT(*) FROM ai_entities")
     total_entities = cursor.fetchone()[0]
-    
     cursor.execute("SELECT COUNT(*) FROM ai_relationships")
     total_relationships = cursor.fetchone()[0]
-    
     cursor.execute("SELECT COUNT(DISTINCT verse_id) FROM ai_verse_entities")
     total_verse_links = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(DISTINCT concept) FROM ai_verse_concepts")
+    total_concepts = cursor.fetchone()[0]
 
     cursor.execute("""
-        SELECT entity_type, COUNT(*) FROM ai_entities GROUP BY entity_type ORDER BY COUNT(*) DESC
+        SELECT entity_type, COUNT(*) FROM ai_entities
+        GROUP BY entity_type ORDER BY COUNT(*) DESC
     """)
     by_type = cursor.fetchall()
 
     cursor.execute("""
-        SELECT b.code, b.title, COUNT(DISTINCT ave.verse_id) AS verses_done
-        FROM ai_verse_entities ave
-        JOIN verses v ON v.id = ave.verse_id
+        SELECT b.code, b.title, COUNT(DISTINCT v.id) AS verses_done
+        FROM verses v
         JOIN chapters ch ON ch.id = v.chapter_id
         JOIN cantos ca ON ca.id = ch.canto_id
         JOIN books b ON b.id = ca.book_id
+        WHERE v.ai_processed = 1
         GROUP BY b.id, b.code, b.title
         ORDER BY b.id
     """)
@@ -319,8 +539,7 @@ def ai_progress():
         JOIN books b ON b.id = ca.book_id
         GROUP BY b.id, b.code
     """)
-    total_verses_by_book = cursor.fetchall()
-    total_map = {r[0]: r[1] for r in total_verses_by_book}
+    total_map = {r[0]: r[1] for r in cursor.fetchall()}
 
     cursor.close()
     conn.close()
@@ -329,11 +548,11 @@ def ai_progress():
         "total_entities": total_entities,
         "total_relationships": total_relationships,
         "verses_covered": total_verse_links,
+        "total_concepts": total_concepts,
         "entities_by_type": [{"type": r[0], "count": r[1]} for r in by_type],
         "by_book": [
             {
-                "book": r[0],
-                "title": r[1],
+                "book": r[0], "title": r[1],
                 "verses_done": r[2],
                 "verses_total": total_map.get(r[0], 0),
             }

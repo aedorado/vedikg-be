@@ -4,148 +4,16 @@ import asyncio
 import re
 from bs4 import BeautifulSoup
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 from urllib.parse import urljoin
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from app.db.base import SessionLocal
-from app.models.models import (
-    Canto, Chapter, Verse, Entity, VerseEntity, ScrapeJob, Relationship,
-    ScrapeStatus, MentionLocation, RelationshipType
-)
-from app.nlp.alias_resolver import (
-    resolve_alias, 
-    get_all_known_entities,
-    ALIAS_TO_ENTITY
-)
-from app.nlp.relationship_extractor import RelationshipExtractor
+from app.models.models import Canto, Chapter, Verse, Purport, Author
 from app.nlp.chanda_detector import detect_chanda, detect_chanda_detail
 import json as _json
 
 logger = logging.getLogger(__name__)
-
-# Initialize relationship extractor
-rel_extractor = RelationshipExtractor()
-
-# ── Entity type inference ─────────────────────────────────────────────────────
-_KNOWN_PLACES = {
-    # Upper lokas
-    'bhūloka', 'bhuvarloka', 'svargaloka', 'svarga', 'maharloka',
-    'janaloka', 'tapoloka', 'satyaloka', 'brahmaloka', 'devaloka',
-    'vaikuṇṭha', 'vaikuṇṭhaloka', 'kailāsa', 'pitṛloka',
-    # Lower / hellish lokas
-    'atala', 'vitala', 'sutala', 'talātala', 'mahātala', 'rasātala', 'pātāla',
-    'naraka',
-    # 28 hellish planets (SB 5.26)
-    'tāmisra', 'andhatāmisra', 'raurava', 'mahāraurava', 'kumbhīpāka',
-    'kālasūtra', 'asipatravana', 'sūkaramukha', 'andhakūpa', 'kṛmibhojana',
-    'sandaṁśa', 'taptasūrmi', 'vajrakaṇṭaka-śālmalī', 'vaitaraṇī', 'pūyoda',
-    'prāṇarodha', 'viśasana', 'lālābhakṣa', 'sārameyādana', 'avīci', 'avīcimat',
-    'ayaḥpāna', 'kṣārakardama', 'rakṣogaṇa-bhojana', 'śūlaprota', 'dandaśūka',
-    'avaṭa-nirodhana', 'paryāvartana', 'sūcīmukha',
-    # Cosmological
-    'bhū-maṇḍala', 'bhūmaṇḍala', 'garbhodaka', 'jambūdvīpa',
-    # Sacred/geographic places
-    'naimiṣāraṇya', 'vṛndāvana', 'mathurā', 'dvārakā', 'kurukṣetra',
-    'hastināpura', 'indraprastha', 'ayodhyā', 'laṅkā', 'kiṣkindhā',
-    'prabhāsa', 'prayāga', 'kāśī', 'vārāṇasī', 'badarikāśrama', 'badarī',
-    'puṣkara', 'bharata-varṣa',
-}
-_PLACE_SUFFIXES = ('loka', 'pura', 'nagara', 'kṣetra', 'tala', 'vana', 'āvarta', 'dvīpa')
-_RIVER_NAMES = {
-    'gaṅgā', 'yamunā', 'sarasvatī', 'narmadā', 'godāvarī', 'sindhu',
-    'kālindī', 'kāverī', 'vaitaraṇī',
-}
-
-# Person names that happen to end with place-like suffixes — force as 'person'
-_PERSON_NAME_OVERRIDES = {
-    # -vana endings
-    'cyavana', 'bhavana', 'marudvana', 'yavana', 'jīvana',
-    # -loka endings (śloka = hymn/verse, not a planetary system)
-    'uttamaśloka', 'uttamaḥśloka', 'upaśloka', 'śloka',
-    # misc
-    'nara', 'sthāna', 'nagara', 'nārada', 'rāghava',
-}
-
-# Ethnic groups / peoples — person-type, not places
-_ETHNIC_GROUPS = {
-    'yavana', 'kirāta', 'hūṇa', 'pulinda', 'pulkaśa', 'ābhīra', 'śumbha',
-    'khasa', 'mleccha', 'āndhra', 'niṣāda',
-}
-
-def _infer_entity_type(name: str) -> str:
-    nl = name.lower()
-    if nl in _PERSON_NAME_OVERRIDES or nl in _ETHNIC_GROUPS:
-        return 'person'
-    if nl in _KNOWN_PLACES:
-        return 'place'
-    if nl in _RIVER_NAMES:
-        return 'river'
-    for suf in _PLACE_SUFFIXES:
-        if nl.endswith(suf):
-            # 'śloka' ends with 'loka' but means verse/hymn — not a planetary system
-            if suf == 'loka' and nl.endswith('śloka'):
-                continue
-            return 'place'
-    return 'person'
-
-# Get all known entities (dynamic from alias resolver)
-KNOWN_ENTITY_NAMES = {
-    entity: "person" for entity in get_all_known_entities()
-}
-
-# Legacy - kept for reference but not used
-MAJOR_ENTITIES = {
-    "Krishna": "person",
-    "Arjuna": "person",
-    "Brahma": "person",
-    "Shiva": "person",
-    "Vishnu": "person",
-    "Narada": "sage",
-    "Vyasa": "sage",
-    "Sukadeva": "sage",
-    "Parikshit": "person",
-    "Dhruva": "person",
-    "Prahlada": "person",
-    "Hiranyakashipu": "demon",
-    "Vasudeva": "person",
-    "Devaki": "person",
-    "Kunti": "person",
-    "Draupadi": "person",
-    "Pandavas": "person",
-    "Kauravas": "person",
-    "Kurus": "person",
-    "Bhima": "person",
-    "Yudhishthira": "person",
-    "Indra": "deva",
-    "Surya": "deva",
-    "Chandra": "deva",
-    "Atri": "sage",
-    "Anusuya": "person",
-    "Buddha": "person",
-    "Pariksit": "person",
-    "Janamejaya": "person",
-    "Yudhamanyu": "person",
-    "Uttamaujas": "person",
-    "Dhritarashtra": "person",
-    "Gandhari": "person",
-    "Shakuni": "person",
-    "Karna": "person",
-    "Duryodhana": "person",
-    "Dushasana": "person",
-    "Ashvatthama": "person",
-    "Dronacharya": "person",
-    "Bhishma": "person",
-    "Satyaki": "person",
-    "Abhimanyu": "person",
-    "Ghatotkacha": "person",
-    "Draupadi": "person",
-    "Subhadra": "person",
-    "Rukmini": "person",
-    "Kamsa": "demon",
-    "Jarasandha": "demon",
-    "Shalva": "demon",
-    "Dantavakra": "demon",
-}
 
 
 class VedabaseScraper:
@@ -155,117 +23,194 @@ class VedabaseScraper:
         self.retry_attempts = 3
         self.retry_delay = 2.0
 
-    async def scrape_chapters(self, canto_num: int, chapters: List[int], db: Session):
-        """Scrape specific chapters and save to database.
-        
-        Args:
-            canto_num: Canto number (1-18)
-            chapters: List of chapter numbers to scrape
-            db: Database session
-        """
-        logger.info(f"Starting scrape: SB {canto_num}.{chapters}")
-        
-        for chapter_num in chapters:
-            try:
-                await self._scrape_chapter(canto_num, chapter_num, db)
-            except Exception as e:
-                logger.error(f"Failed to scrape SB {canto_num}.{chapter_num}: {e}")
-                continue
+    async def scrape_chapters(self, canto_num: int, chapters: List[int],
+                              concurrency: int = 5):
+        """Scrape chapters concurrently (default 5 at a time), each with its own DB session."""
+        logger.info(f"Starting scrape: SB {canto_num} chapters {chapters[0]}–{chapters[-1]} "
+                    f"(concurrency={concurrency})")
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _scrape_with_sem(chapter_num: int):
+            async with sem:
+                chapter_db = SessionLocal()
+                try:
+                    await self._scrape_chapter(canto_num, chapter_num, chapter_db)
+                except Exception as e:
+                    logger.error(f"Failed to scrape SB {canto_num}.{chapter_num}: {e}")
+                finally:
+                    chapter_db.close()
+
+        await asyncio.gather(*[_scrape_with_sem(ch) for ch in chapters])
 
     async def _scrape_chapter(self, canto_num: int, chapter_num: int, db: Session):
-        """Scrape a single chapter."""
+        """Scrape a single chapter — fetch all verses concurrently, bulk insert once."""
         logger.info(f"Scraping SB {canto_num}.{chapter_num}...")
-        
-        # Get or create chapter record
-        canto = self._get_or_create_canto(db, canto_num)
-        chapter = self._get_or_create_chapter(db, canto.id, chapter_num)
-        
-        # Fetch chapter index to find all verses
-        chapter_url = f"{self.base_url}/en/library/sb/{canto_num}/{chapter_num}/"
-        verse_urls = await self._discover_verses(chapter_url)
-        
-        logger.info(f"Found {len(verse_urls)} verses in SB {canto_num}.{chapter_num}")
-        
-        # Scrape each verse
-        for verse_num, verse_url in enumerate(verse_urls, 1):
-            try:
-                await self._scrape_verse(db, chapter, verse_num, verse_url)
-                
-                # Save checkpoint after each verse
-                db.commit()
-                logger.info(f"✓ SB {canto_num}.{chapter_num}.{verse_num}")
-                
-            except Exception as e:
-                logger.error(f"Error scraping verse {verse_num}: {e}")
-                db.rollback()
-                continue
-        
-        logger.info(f"✓ Completed SB {canto_num}.{chapter_num}")
 
-    async def _discover_verses(self, chapter_url: str) -> List[str]:
-        """Discover all verse URLs in a chapter."""
-        html = await self._fetch_url(chapter_url)
-        if not html:
-            return []
-        
+        chapter_url = f"{self.base_url}/en/library/sb/{canto_num}/{chapter_num}/"
+        chapter_html = await self._fetch_url(chapter_url)
+        if not chapter_html:
+            logger.error(f"Could not fetch chapter page {chapter_url}")
+            return
+
+        chapter_meta = self._parse_chapter_meta(chapter_html, canto_num, chapter_num)
+        canto = self._get_or_create_canto(db, canto_num, chapter_meta.get("canto_title"))
+        chapter = self._get_or_create_chapter(
+            db, canto.id, chapter_num,
+            title=chapter_meta.get("chapter_title"),
+            summary=chapter_meta.get("chapter_summary"),
+            source_url=chapter_url,
+        )
+        db.commit()
+
+        verse_urls = self._extract_verse_urls(chapter_html, chapter_url)
+        logger.info(f"Found {len(verse_urls)} verse URLs in SB {canto_num}.{chapter_num}")
+        if not verse_urls:
+            return
+
+        # Fetch all verse pages concurrently
+        htmls = await asyncio.gather(*[self._fetch_url(url) for url in verse_urls])
+
+        # Resolve Prabhupāda's author_id once per chapter
+        prabhupada = db.query(Author).filter_by(slug="srila-prabhupada").first()
+        prabhupada_id = prabhupada.id if prabhupada else None
+
+        # Parse in memory — no DB touches yet
+        rows = []       # verse dicts
+        purports = []   # (full_reference, purport_html, purport_text) for purports table
+        now = datetime.utcnow()
+        for verse_url, html in zip(verse_urls, htmls):
+            if not html:
+                continue
+            verse_data = self._parse_verse(html, verse_url)
+            if not verse_data:
+                continue
+
+            full_ref = verse_data.get("full_reference") or \
+                       f"SB {canto_num}.{chapter_num}.{self._verse_num_from_url(verse_url, chapter_num)}"
+            m = re.search(r'\.(\d+)(?:-\d+)?$', full_ref)
+            ref_verse_num = int(m.group(1)) if m else self._verse_num_from_url(verse_url, chapter_num)
+            transliteration = verse_data.get("transliteration", "")
+            rows.append(dict(
+                chapter_id=chapter.id,
+                verse_number=ref_verse_num,
+                full_reference=full_ref,
+                source_url=verse_url,
+                devanagari=verse_data.get("devanagari", ""),
+                transliteration=transliteration,
+                translation=verse_data.get("translation", ""),
+                synonyms_raw=verse_data.get("synonyms", ""),
+                chanda=detect_chanda(transliteration),
+                chanda_json=_json.dumps(detect_chanda_detail(transliteration), ensure_ascii=False) if transliteration else None,
+                scraped_at=now,
+            ))
+            if verse_data.get("purport_html") or verse_data.get("purport_text"):
+                purports.append((
+                    full_ref,
+                    verse_data.get("purport_html", ""),
+                    verse_data.get("purport_text", ""),
+                ))
+
+        if not rows:
+            logger.warning(f"No verses parsed for SB {canto_num}.{chapter_num}")
+            return
+
+        # Skip already-scraped verses
+        existing_refs = {
+            r[0] for r in db.query(Verse.full_reference)
+            .filter(Verse.full_reference.in_([r["full_reference"] for r in rows]))
+            .all()
+        }
+        new_rows = [r for r in rows if r["full_reference"] not in existing_refs]
+
+        if not new_rows:
+            logger.info(f"✓ SB {canto_num}.{chapter_num} — all {len(rows)} verses already in DB")
+            return
+
+        db.execute(Verse.__table__.insert(), new_rows)
+        db.flush()
+
+        # Bulk insert purports linked to newly inserted verse ids
+        if purports and prabhupada_id:
+            new_refs = {r["full_reference"] for r in new_rows}
+            ref_to_id = {
+                ref: vid for ref, vid in
+                db.query(Verse.full_reference, Verse.id)
+                .filter(Verse.full_reference.in_(new_refs))
+                .all()
+            }
+            purport_rows = [
+                dict(verse_id=ref_to_id[ref], author_id=prabhupada_id,
+                     body_html=html, body_text=text, language="en")
+                for ref, html, text in purports
+                if ref in ref_to_id and (html or text)
+            ]
+            if purport_rows:
+                db.execute(Purport.__table__.insert(), purport_rows)
+
+        db.commit()
+        logger.info(f"✓ SB {canto_num}.{chapter_num} — inserted {len(new_rows)} verses, "
+                    f"{len(purport_rows) if purports and prabhupada_id else 0} purports "
+                    f"(skipped {len(rows) - len(new_rows)} existing)")
+
+    def _verse_num_from_url(self, verse_url: str, chapter_num: int) -> int:
+        """Extract starting verse number from URL like .../sb/10/14/8/ or .../sb/10/14/8-9/"""
+        m = re.search(r'/sb/\d+/\d+/(\d+)', verse_url)
+        if m:
+            return int(m.group(1))
+        return 0
+
+    def _extract_verse_urls(self, html: str, chapter_url: str) -> List[str]:
+        """Extract verse URLs from already-fetched chapter HTML."""
         soup = BeautifulSoup(html, "html.parser")
         verse_links = []
-        
-        # Find all verse links (pattern: Text 1, Text 2, etc.)
         for link in soup.find_all("a", href=True):
             href = link.get("href", "")
-            # Look for verse pattern: /sb/{c}/{ch}/{v}/
-            if re.match(r"/en/library/sb/\d+/\d+/\d+/?$", href):
+            if re.match(r"/en/library/sb/\d+/\d+/[\d\-]+/?$", href):
                 verse_url = urljoin(self.base_url, href)
                 if verse_url not in verse_links:
                     verse_links.append(verse_url)
-        
         return verse_links
 
-    async def _scrape_verse(self, db: Session, chapter: Chapter, verse_num: int, verse_url: str):
-        """Scrape a single verse and save to database."""
-        logger.debug(f"Fetching {verse_url}")
-        html = await self._fetch_url(verse_url)
-        if not html:
-            logger.debug(f"No HTML returned for verse {verse_num}")
-            return
-        
-        logger.info(f"Parsing verse {verse_num}")
-        verse_data = self._parse_verse(html, verse_url)
-        if not verse_data:
-            logger.info(f"No verse data parsed for verse {verse_num}")
-            return
-        
-        logger.info(f"Creating database record for verse {verse_num}")
-        # Skip if this verse was already scraped
-        full_ref = f"SB {chapter.canto.number}.{chapter.chapter_number}.{verse_num}"
-        existing_verse = db.query(Verse).filter_by(full_reference=full_ref).first()
-        if existing_verse:
-            logger.info(f"Verse {full_ref} already in DB, skipping")
-            return
+    def _parse_chapter_meta(self, html: str, canto_num: int, chapter_num: int) -> dict:
+        """Parse chapter title and canto title from the vedabase RSC payload."""
+        meta = {}
 
-        # Create verse record
-        verse = Verse(
-            chapter_id=chapter.id,
-            verse_number=verse_num,
-            full_reference=full_ref,
-            source_url=verse_url,
-            devanagari=verse_data.get("devanagari", ""),
-            transliteration=verse_data.get("transliteration", ""),
-            translation=verse_data.get("translation", ""),
-            synonyms_raw=verse_data.get("synonyms", ""),
-            purport_html=verse_data.get("purport_html", ""),
-            purport_text=verse_data.get("purport_text", ""),
-            chanda=detect_chanda(verse_data.get("transliteration", "")),
-            chanda_json=_json.dumps(detect_chanda_detail(verse_data.get("transliteration", "")), ensure_ascii=False) if verse_data.get("transliteration") else None,
-            scraped_at=datetime.utcnow(),
-        )
-        db.add(verse)
-        db.flush()
-        
-        logger.debug(f"Extracting entities for verse {verse_num}")
-        # Extract and link entities
-        self._extract_and_link_entities(db, verse, verse_data)
+        # vedabase is a Next.js app that embeds data in RSC payload chunks.
+        # The chunk containing page props has: "chapter_title":"Questions by the Sages"
+        # Payload uses escaped quotes: chapter_title\":\"Questions by the Sages\"
+        m = re.search(r'chapter_title\\":\\"([^\\"]+)\\"', html)
+        if m:
+            meta["chapter_title"] = m.group(1)
+
+        # Canto breadcrumb: "Canto 1: Creation\\"
+        m = re.search(rf'Canto\s+{canto_num}:\s*([^\\"]+)\\"', html)
+        if m:
+            meta["canto_title"] = f"Canto {canto_num}: {m.group(1).strip()}"
+
+        # Chapter summary: text in em-mb-4 divs before the first "Text 1:" link
+        # The page renders content twice (SSR + RSC), so deduplicate by seen set
+        soup = BeautifulSoup(html, "html.parser")
+        summary_parts = []
+        seen = set()
+        for div in soup.find_all("div", class_=re.compile(r"em-mb-4")):
+            a = div.find("a")
+            if a and re.search(r"Text\s+1\b", a.get_text()):
+                break
+            text = div.get_text(" ", strip=True)
+            if len(text) > 80 and text not in seen:
+                seen.add(text)
+                summary_parts.append(text)
+        if summary_parts:
+            meta["chapter_summary"] = "\n\n".join(summary_parts)
+
+        return meta
+
+    async def _discover_verses(self, chapter_url: str) -> List[str]:
+        """Discover all verse URLs in a chapter (kept for backward compat)."""
+        html = await self._fetch_url(chapter_url)
+        if not html:
+            return []
+        return self._extract_verse_urls(html, chapter_url)
 
     def _parse_verse(self, html: str, url: str) -> Optional[Dict]:
         """Parse verse HTML - extract verse data and purport."""
@@ -279,8 +224,29 @@ class VedabaseScraper:
                 "synonyms": "",
                 "purport_html": "",
                 "purport_text": "",
+                "full_reference": None,
             }
             
+            # Extract canonical reference from page (e.g. "SB 10.14.8" or "SB 10.14.8-9")
+            # vedabase puts it in <title> or a canonical heading
+            page_title = soup.find("title")
+            if page_title:
+                m = re.search(r'SB\s+(\d+\.\d+\.[\d\-]+)', page_title.get_text())
+                if m:
+                    data["full_reference"] = "SB " + m.group(1)
+            if not data["full_reference"]:
+                # Try og:title or canonical meta
+                og = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "title"})
+                if og:
+                    m = re.search(r'SB\s+(\d+\.\d+\.[\d\-]+)', og.get("content", ""))
+                    if m:
+                        data["full_reference"] = "SB " + m.group(1)
+            if not data["full_reference"]:
+                # Fall back to URL
+                m = re.search(r'/sb/(\d+)/(\d+)/([\d\-]+)/?$', url)
+                if m:
+                    data["full_reference"] = f"SB {m.group(1)}.{m.group(2)}.{m.group(3)}"
+
             # Remove script, style, header/nav/footer tags
             for tag in soup(["script", "style", "header", "nav", "footer", "iframe"]):
                 tag.decompose()
@@ -370,202 +336,85 @@ class VedabaseScraper:
             logger.error(f"Parse error for {url}: {e}")
             return None
 
-    def _extract_and_link_entities(self, db: Session, verse: Verse, verse_data: Dict):
-        """Extract entity mentions and relationships using NLP-based approach."""
-        verse_text = verse_data.get("translation", "") or ""
-        purport_text = verse_data.get("purport_text", "") or ""
-        combined_text = verse_text + "\n" + purport_text
-
-        found_entities = rel_extractor.extract_all_entities(combined_text)
-
-        found_entity_ids = {}
-
-        for entity_name in found_entities:
-            verse_mention = self._find_mention(entity_name, verse_text)
-            purport_mention = self._find_mention(entity_name, purport_text)
-
-            entity = db.query(Entity).filter_by(normalized_name=entity_name.lower()).first()
-            if not entity:
-                entity = Entity(
-                    name=entity_name,
-                    normalized_name=entity_name.lower(),
-                    entity_type=_infer_entity_type(entity_name),
-                )
-                db.add(entity)
-                db.flush()
-
-            found_entity_ids[entity_name] = entity.id
-
-            if verse_mention and purport_mention:
-                location, mention_text = "both", verse_mention
-            elif verse_mention:
-                location, mention_text = "verse_text", verse_mention
-            elif purport_mention:
-                location, mention_text = "purport_text", purport_mention
-            else:
-                continue
-
-            # Avoid duplicate verse_entity rows
-            existing_ve = db.query(VerseEntity).filter_by(
-                verse_id=verse.id, entity_id=entity.id
-            ).first()
-            if not existing_ve:
-                db.add(VerseEntity(
-                    verse_id=verse.id,
-                    entity_id=entity.id,
-                    mention_location=location,
-                    mention_text=mention_text[:200],
-                    confidence_score=0.95,
-                ))
-
-        # ── Relationships ─────────────────────────────────────────────────────
-        relationships = rel_extractor.extract_relationships(combined_text)
-
-        for entity1_name, entity2_name, rel_type in relationships:
-            # Ensure both entities exist (they may be newly discovered via rel patterns)
-            for name in (entity1_name, entity2_name):
-                if name not in found_entity_ids:
-                    ent = db.query(Entity).filter_by(normalized_name=name.lower()).first()
-                    if not ent:
-                        ent = Entity(
-                            name=name,
-                            normalized_name=name.lower(),
-                            entity_type=_infer_entity_type(name),
-                        )
-                        db.add(ent)
-                        db.flush()
-                    found_entity_ids[name] = ent.id
-
-            e1_id = found_entity_ids.get(entity1_name)
-            e2_id = found_entity_ids.get(entity2_name)
-            if not e1_id or not e2_id:
-                continue
-
-            rel_type_val = self._map_relationship_type(rel_type)
-            if not rel_type_val:
-                continue
-
-            # Avoid duplicate relationships
-            existing_rel = db.query(Relationship).filter_by(
-                source_entity_id=e1_id,
-                target_entity_id=e2_id,
-                relationship_type=rel_type_val,
-            ).first()
-            if not existing_rel:
-                db.add(Relationship(
-                    source_entity_id=e1_id,
-                    target_entity_id=e2_id,
-                    relationship_type=rel_type_val,
-                    source_verse_id=verse.id,
-                    confidence_score=0.85,
-                ))
-                logger.debug(f"  ↳ {entity1_name} —{rel_type}→ {entity2_name}")
-
-        logger.debug(f"  entities={len(found_entities)} rels={len(relationships)}")
-    
-    def _map_relationship_type(self, rel_type_str: str) -> Optional[str]:
-        """Map relationship string to RelationshipType enum value."""
-        mapping = {
-            "father_of": "father_of",
-            "mother_of": "mother_of",
-            "son_of": "son_of",
-            "daughter_of": "daughter_of",
-            "brother_of": "brother_of",
-            "sister_of": "sister_of",
-            "spouse_of": "spouse_of",
-        }
-        return mapping.get(rel_type_str)
-
-
-    def _find_mention(self, entity_name: str, text: str) -> Optional[str]:
-        """Find entity mention in text with context, checking all aliases."""
-        if not text:
-            return None
-        
-        # Get all aliases for this entity
-        from app.nlp.alias_resolver import get_aliases_for_entity
-        aliases = get_aliases_for_entity(entity_name)
-        
-        text_lower = text.lower()
-        
-        # Check each alias
-        for alias in aliases:
-            alias_lower = alias.lower()
-            idx = text_lower.find(alias_lower)
-            if idx != -1:
-                # Extract context (50 chars before and after)
-                start = max(0, idx - 50)
-                end = min(len(text), idx + len(alias) + 50)
-                return text[start:end].strip()
-        
-        # Fallback to entity name if not found in aliases
-        entity_lower = entity_name.lower()
-        idx = text_lower.find(entity_lower)
-        if idx == -1:
-            return None
-        
-        # Extract context (50 chars before and after)
-        start = max(0, idx - 50)
-        end = min(len(text), idx + len(entity_name) + 50)
-        
-        return text[start:end].strip()
-
     async def _fetch_url(self, url: str, attempt: int = 1) -> Optional[str]:
-        """Fetch URL with retry logic."""
+        """Fetch URL with retry logic. 404s are not retried."""
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 logger.debug(f"Fetching attempt {attempt}: {url}")
                 response = await client.get(url)
+                if response.status_code == 404:
+                    logger.debug(f"404 — skipping {url}")
+                    return None
                 response.raise_for_status()
-                logger.debug(f"Successfully fetched {url}")
                 return response.text
+        except httpx.HTTPStatusError:
+            # Already handled 404 above; other 4xx are not worth retrying
+            return None
         except Exception as e:
             if attempt < self.retry_attempts:
-                logger.warning(f"Fetch failed (attempt {attempt}), retrying in {self.retry_delay}s: {url}")
-                await asyncio.sleep(self.retry_delay)
+                delay = self.retry_delay * (2 ** (attempt - 1))  # exponential backoff
+                logger.warning(f"Fetch failed (attempt {attempt}/{self.retry_attempts}), retrying in {delay:.1f}s: {url}")
+                await asyncio.sleep(delay)
                 return await self._fetch_url(url, attempt + 1)
             else:
                 logger.error(f"Failed to fetch {url} after {self.retry_attempts} attempts")
                 return None
 
-    def _get_or_create_canto(self, db: Session, canto_num: int) -> Canto:
-        """Get or create canto record."""
-        canto = db.query(Canto).filter_by(number=canto_num).first()
-        if not canto:
-            canto = Canto(
-                number=canto_num,
-                title=f"Canto {canto_num}",
-                slug=f"canto-{canto_num}",
-            )
-            db.add(canto)
+    def _get_or_create_canto(self, db: Session, canto_num: int, title: str = None) -> Canto:
+        """Get or create canto record, safe under concurrent scrapers."""
+        from app.models.models import Book
+        sb_book = db.query(Book).filter_by(code='SB').first()
+        if not sb_book:
+            sb_book = Book(code='SB', title='Śrīmad-Bhāgavatam',
+                           url_prefix='https://vedabase.io/en/library/sb/')
+            db.add(sb_book)
             db.flush()
+        canto = db.query(Canto).filter_by(book_id=sb_book.id, number=canto_num).first()
+        if not canto:
+            try:
+                canto = Canto(
+                    number=canto_num,
+                    title=title or f"Canto {canto_num}",
+                    slug=f"sb-canto-{canto_num}",
+                    book_id=sb_book.id,
+                )
+                db.add(canto)
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                canto = db.query(Canto).filter_by(book_id=sb_book.id, number=canto_num).first()
+        elif title and (not canto.title or canto.title == f"Canto {canto_num}"):
+            canto.title = title
         return canto
 
-    def _get_or_create_chapter(self, db: Session, canto_id: int, chapter_num: int) -> Chapter:
-        """Get or create chapter record."""
-        chapter = db.query(Chapter).filter_by(
-            canto_id=canto_id, 
-            chapter_number=chapter_num
-        ).first()
+    def _get_or_create_chapter(self, db: Session, canto_id: int, chapter_num: int,
+                                title: str = None, summary: str = None, source_url: str = None) -> Chapter:
+        """Get or create chapter record, safe under concurrent scrapers."""
+        chapter = db.query(Chapter).filter_by(canto_id=canto_id, chapter_number=chapter_num).first()
         if not chapter:
-            chapter = Chapter(
-                canto_id=canto_id,
-                chapter_number=chapter_num,
-                title=f"Chapter {chapter_num}",
-                slug=f"chapter-{chapter_num}",
-            )
-            db.add(chapter)
-            db.flush()
+            try:
+                chapter = Chapter(
+                    canto_id=canto_id,
+                    chapter_number=chapter_num,
+                    title=title or f"Chapter {chapter_num}",
+                    slug=f"chapter-{chapter_num}",
+                    summary=summary,
+                    source_url=source_url,
+                )
+                db.add(chapter)
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                chapter = db.query(Chapter).filter_by(canto_id=canto_id, chapter_number=chapter_num).first()
+        else:
+            if title and (not chapter.title or chapter.title == f"Chapter {chapter_num}"):
+                chapter.title = title
+            if summary and not chapter.summary:
+                chapter.summary = summary
+            if source_url and not chapter.source_url:
+                chapter.source_url = source_url
         return chapter
 
     async def scrape_sample(self):
         """Scrape SB 1.1-5 (Chapters 1-5, ~250 verses) as sample."""
-        db = SessionLocal()
-        try:
-            await self.scrape_chapters(canto_num=1, chapters=[1, 2, 3, 4, 5], db=db)
-            logger.info("✓ Sample scrape (SB 1.1-5) completed successfully")
-        except Exception as e:
-            logger.error(f"Sample scrape failed: {e}")
-            db.rollback()
-        finally:
-            db.close()
+        await self.scrape_chapters(canto_num=1, chapters=[1, 2, 3, 4, 5])

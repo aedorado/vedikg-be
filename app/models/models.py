@@ -153,30 +153,30 @@ class Verse(Base):
 
 
 class Entity(Base):
-    __tablename__ = "entities"
+    __tablename__ = "ai_entities"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(255), unique=True, index=True)
-    normalized_name = Column(String(255), index=True)
-    entity_type = Column(String(50))
+    name = Column(String(255), index=True)
+    normalized_name = Column(String(255), unique=True, index=True)
+    entity_type = Column(String(50), nullable=True)
     description = Column(Text, nullable=True)
     aliases_json = Column(Text, nullable=True)
-    image_url = Column(String(500), nullable=True)
-    first_appearance_verse_id = Column(Integer, ForeignKey("verses.id"), nullable=True)
+    sanskrit_name = Column(String(255), nullable=True)
+    first_seen_verse_id = Column(Integer, ForeignKey("verses.id"), nullable=True)
+    mention_count = Column(Integer, default=1)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
     verse_entities = relationship("VerseEntity", back_populates="entity")
 
 
 class VerseEntity(Base):
-    __tablename__ = "verse_entities"
+    __tablename__ = "ai_verse_entities"
 
     id = Column(Integer, primary_key=True, index=True)
     verse_id = Column(Integer, ForeignKey("verses.id"), index=True)
-    entity_id = Column(Integer, ForeignKey("entities.id"), index=True)
-    mention_location = Column(String(50))
-    mention_text = Column(Text, nullable=True)
-    context_summary = Column(Text, nullable=True)
-    confidence_score = Column(Float, default=1.0)
+    entity_id = Column(Integer, ForeignKey("ai_entities.id"), index=True)
+    confidence = Column(Float, default=1.0)
+    mention_source = Column(String(20), default="verse", nullable=True)
 
     verse = relationship("Verse", back_populates="entities")
     entity = relationship("Entity", back_populates="verse_entities")

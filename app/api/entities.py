@@ -9,7 +9,13 @@ router = APIRouter(prefix="/api/entities", tags=["entities"])
 
 @router.get("")
 @router.get("/")
-def list_entities(type: str = Query(None), book: str = Query(None), db: Session = Depends(get_db)):
+def list_entities(
+    type: str = Query(None),
+    book: str = Query(None),
+    canto: int = Query(None),
+    chapter: int = Query(None),
+    db: Session = Depends(get_db)
+):
     mentions_sq = (
         db.query(
             VerseEntity.entity_id,
@@ -22,24 +28,36 @@ def list_entities(type: str = Query(None), book: str = Query(None), db: Session 
     if type:
         types = [t.strip() for t in type.split(",")]
         q = q.filter(Entity.entity_type.in_(types))
-    if book:
-        book_obj = db.query(Book).filter_by(code=book.upper()).first()
-        if book_obj:
-            q = q.filter(
-                Entity.id.in_(
-                    db.query(VerseEntity.entity_id)
-                    .join(Verse, VerseEntity.verse_id == Verse.id)
-                    .filter(Verse.book_id == book_obj.id)
-                    .subquery()
-                )
+    # Build filtering subquery for book/canto/chapter
+    verse_filter = None
+    if book or canto or chapter:
+        verse_q = db.query(Verse.id)
+        if book:
+            book_obj = db.query(Book).filter_by(code=book.upper()).first()
+            if book_obj:
+                verse_q = verse_q.filter(Verse.book_id == book_obj.id)
+        if canto is not None or chapter is not None:
+            verse_q = verse_q.join(Chapter, Verse.chapter_id == Chapter.id).join(Canto, Chapter.canto_id == Canto.id)
+            if canto is not None:
+                verse_q = verse_q.filter(Canto.number == canto)
+            if chapter is not None:
+                verse_q = verse_q.filter(Chapter.chapter_number == chapter)
+
+        verse_filter = verse_q.subquery()
+        q = q.filter(
+            Entity.id.in_(
+                db.query(VerseEntity.entity_id)
+                .join(Verse, VerseEntity.verse_id == Verse.id)
+                .filter(Verse.id.in_(db.query(verse_filter.c.id)))
+                .subquery()
             )
+        )
     rows = q.order_by(Entity.name).all()
     canto_rows = (
         db.query(VerseEntity.entity_id, Canto.number)
         .join(Verse, VerseEntity.verse_id == Verse.id)
         .join(Chapter, Verse.chapter_id == Chapter.id)
         .join(Canto, Chapter.canto_id == Canto.id)
-        .filter(VerseEntity.mention_location.in_(["verse_text", "both"]))
         .distinct()
         .all()
     )
@@ -59,18 +77,17 @@ def list_entities(type: str = Query(None), book: str = Query(None), db: Session 
 
 @router.get("/graph/all")
 def get_full_graph(source: str = Query("verse"), db: Session = Depends(get_db)):
-    """Return entities and relationships. source=verse (default) or source=all."""
+    """Return person entities and familial relationships only."""
     if source == "verse":
         verse_ids_sq = (
             db.query(VerseEntity.entity_id)
-            .filter(VerseEntity.mention_location.in_(["verse_text", "both"]))
             .distinct()
             .subquery()
         )
-        entities = db.query(Entity).filter(Entity.id.in_(verse_ids_sq)).all()
+        entities = db.query(Entity).filter(Entity.id.in_(verse_ids_sq), Entity.entity_type == "person").all()
     else:
-        entities = db.query(Entity).all()
-    rels = db.query(Relationship).all()
+        entities = db.query(Entity).filter(Entity.entity_type == "person").all()
+    rels = db.query(Relationship).filter(Relationship.relationship_type.contains("of")).all()
     entity_id_set = {e.id for e in entities}
     nodes = [{"id": e.id, "name": e.name, "type": e.entity_type} for e in entities]
     edges = [
