@@ -2,7 +2,7 @@ name: Extract Entities Hourly
 
 on:
   schedule:
-    # Run every 3 hours at minute 0 (to allow 2-2.5 hours per chapter)
+    # Run every hour at minute 0 (to allow 2-2.5 hours per chapter)
     - cron: '0 */1 * * *'
   workflow_dispatch:  # Allow manual trigger
 
@@ -23,10 +23,14 @@ jobs:
         run: |
           pip install --no-cache-dir -r requirements.txt
 
+      - name: Create .env file
+        run: |
+          cat > .env << EOF
+          POSTGRES_URL=${{ secrets.POSTGRES_URL }}
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          EOF
+
       - name: Extract entities (one chapter)
-        env:
-          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           echo "Starting extraction at $(date)"
           python extract_entities.py --all --limit 1
