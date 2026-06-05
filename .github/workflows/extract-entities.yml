@@ -21,7 +21,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          cd vedikg-be
           pip install --no-cache-dir -r requirements.txt
 
       - name: Extract entities (one chapter)
