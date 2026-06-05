@@ -2,7 +2,7 @@ name: Extract Entities Hourly
 
 on:
   schedule:
-    # Run every 3 hours at minute 0 (to allow 2-2.5 hours per chapter)
+    # Run every hour at minute 0 (to allow 2-2.5 hours per chapter)
     - cron: '0 */1 * * *'
   workflow_dispatch:  # Allow manual trigger
 
@@ -23,7 +23,7 @@ jobs:
         run: |
           cat > .env << EOF
           POSTGRES_URL=${{ secrets.POSTGRES_URL }}
-          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS=${{ secrets.GEMINI_API_KEYS }}
           EOF
 
       - name: Install dependencies
