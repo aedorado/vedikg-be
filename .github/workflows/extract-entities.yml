@@ -1,0 +1,44 @@
+name: Extract Entities Hourly
+
+on:
+  schedule:
+    # Run every 3 hours at minute 0 (to allow 2-2.5 hours per chapter)
+    - cron: '0 */1 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  extract-entities:
+    runs-on: ubuntu-latest
+    timeout-minutes: 160
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          cd vedikg-be
+          pip install --no-cache-dir -r requirements.txt
+
+      - name: Extract entities (one chapter)
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          cd vedikg-be
+          echo "Starting extraction at $(date)"
+          python extract_entities.py --all --limit 1
+          echo "Extraction complete at $(date)"
+
+      - name: Report status
+        if: always()
+        run: |
+          if [ ${{ job.status }} = "success" ]; then
+            echo "✓ Extraction completed successfully"
+          else
+            echo "✗ Extraction failed - check logs above"
+          fi
