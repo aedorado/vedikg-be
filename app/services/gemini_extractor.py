@@ -275,208 +275,99 @@ CANONICAL_NAMES: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Prompt — deep, 1-verse, with self-verification of relationships
+# Prompt — compact system instruction + worked example
 # ---------------------------------------------------------------------------
 
 
-SYSTEM_PROMPT = """You are an expert Vaishnava scholar with deep knowledge of the Srimad-Bhagavatam (SB), Caitanya-caritamrta (CC), Caitanya Bhagavata (CB), and Bhakti-rasamrta-sindhu (BRS).
+SYSTEM_PROMPT = """You are an expert Vaishnava scholar (SB, CC, CB, BRS). Given ONE verse with translation and purport, extract entities, relationships, and concepts.
 
+## BOOK CONTEXT — AUTHOR IDENTIFICATION
+The verse reference prefix tells you who the author/speaker is when the text uses "I":
+- BRS (Bhakti-rasamrta-sindhu) → author is **Rupa Goswami**
+- CC (Caitanya-caritamrta) → author is **Krishnadasa Kaviraja Goswami**
+- CB (Caitanya Bhagavata) → author is **Vrindavana Dasa Thakura**
+- SB (Srimad-Bhagavatam) → compiled by Vyasa; narrated by Sukadeva to Parikshit
 
-You will receive ONE verse with its translation and full purport. Extract EVERYTHING with maximum depth and precision.
+When a verse uses first-person ("I offer my respects", "I have undertaken this work", "I am ignorant"), extract the author as an entity and add a relationship like `authored_by` or `worships` as appropriate.
 
+## NAMES
+- "name": plain English, no diacritics, no possessives — "Krishna" not "Kṛṣṇa" or "Krishna's"
+- "sanskrit_name": full diacritics
+- Same canonical name everywhere (entities, relationships, verse_summaries)
+- Canonical mappings:
+  Krsna/Govinda/Madhusudana/Vasudeva/Murari/Hari → "Krishna"
+  Visnu/Narayana/Hari(Narayana context) → "Vishnu"
+  Brahma/Brahmā → "Brahma"
+  Siva/Mahadeva/Sankara/Rudra → "Shiva"
+  Nārada → "Narada" | Vyāsa/Vyasadeva → "Vyasa" | Śukadeva/Suka → "Sukadeva"
+  Parīkṣit → "Parikshit" | Caitanya/Gauranga/Gauracandra → "Chaitanya Mahaprabhu"
 
-══════════════════════════════════════════════════════
-CANONICAL NAME RULES — STRICTLY FOLLOW
-══════════════════════════════════════════════════════
-1. NEVER use diacritics in the "name" field — plain English only
-  ✓ "Krishna"  ✗ "Kṛṣṇa" or "Krsna"
-  ✓ "Vishnu"   ✗ "Viṣṇu"
-  ✓ "Narada"   ✗ "Nārada"
+## ENTITY TYPES
+Extract only entities that are clearly and meaningfully present. Fewer accurate entities are better than many uncertain ones — if you are not confident an entity belongs, omit it.
 
+| type | notes |
+|------|-------|
+| person | named humans only — NOT devotee categories or archetypes |
+| deva | gods/divine beings |
+| demon | asuras, rakshasas |
+| sage | rishis, munis |
+| animal | named animals only |
+| place | cities, forests, realms — Vrindavan, Vaikuntha, spiritual world ARE places, NOT concepts |
+| river | any named river |
+| mountain | any named mountain |
+| kingdom | ruled territories |
+| dynasty | ruling lineages |
+| concept | philosophical ideas, virtues, vices, spiritual practices — NOT book divisions/chapters/sections |
+| object | significant physical items |
+| text | scriptural works |
 
-2. NEVER use possessive forms as entity names
-  ✓ "Krishna"  ✗ "Krishna's"
+**description**: Gaudiya Vaishava specific encyclopedic knowledge about this entity — never specific to this verse. Keep to 1–2 sentences.
+**aliases**: ONLY alternate names that explicitly appear in this verse or purport text. Do not add well-known aliases that are absent from the passage.
 
+## RELATIONSHIPS
+Extract ONLY what is explicitly stated or clearly implied in THIS text. Do NOT add general scriptural knowledge absent from the passage.
+If no clear relationship exists between two entities, DO NOT invent one — it is better to have zero relationships than a forced or wrong one.
 
-3. Use the SAME canonical name consistently everywhere in your response
+"source [type] target" must be a true statement — direction matters.
+✓ source="Devaki" type="mother_of" target="Krishna"
+✗ source="Kamsa" type="killed_by" target="Krishna" (passive voice — wrong)
 
+Preferred types (you may invent a precise type if none fits):
+- Family: father_of, mother_of, son_of, daughter_of, brother_of, sister_of, spouse_of, uncle_of, nephew_of, cousin_of, grandfather_of, grandson_of, stepfather_of, stepmother_of, father_in_law_of, adopted_son_of
+- Spiritual: guru_of, disciple_of, devotee_of, servant_of, friend_of, enemy_of, worships, surrenders_to, takes_shelter_of, glorifies, prays_to, initiated_by
+- Action: kills, blesses, curses, instructs, rescues, protects, liberates, sends, receives, steals, imprisons, defeats, grants_boon_to
+- Role/identity: king_of, minister_of, commander_of, resident_of, incarnation_of, expansion_of, avatar_of, manifests_as, rules_over, born_in, located_in, authored_by, associated_with
 
-4. Put diacritic transliteration ONLY in the "sanskrit_name" field
+Confidence: high = explicit in text; medium = clearly implied; low = omit entirely
 
+## ENTITY QUALITY
+Do NOT extract vague catch-all entities. These are the most common offenders:
+- "scripture" / "the scriptures" → extract the SPECIFIC named text (Skanda Purana, Bhagavad Gita) OR skip it; "scripture" as a generic node produces meaningless relationships
+- "devotee", "the practitioner", "a person", "one who" → these describe a category, not a named individual; extract the concept instead (e.g. "uttamādhikārī" as a concept)
+- "the Lord", "the Supreme" without context → resolve to the specific deity only if the passage makes it unambiguous; if it could be Krishna or Vishnu or another, skip the entity rather than guess
 
-5. Standard canonical mappings:
-  Krsna / Govinda / Madhusudana / Vasudeva → "Krishna"
-  Visnu / Hari → "Vishnu" (distinct from Narayana)
-  Brahma / Brahmā → "Brahma"
-  Siva / Śiva / Mahadeva / Sankara → "Shiva"
-  Nārada → "Narada"
-  Vyāsa / Vyasadeva → "Vyasa"
-  Śukadeva / Suka → "Sukadeva"
-  Parīkṣit / Pariksit → "Parikshit"
-  Caitanya / Gauranga → "Chaitanya Mahaprabhu"
+A generic entity as a relationship source/target is a red flag — if you find yourself writing `source="scripture"`, stop and reconsider.
 
+## CONCEPTS
+Valid: bhakti, jnana, karma, maya, dharma, moksha, lila, rasa, vairagya, austerity, humility, surrender, attachment, detachment, pride, compassion, dasya, sakhya, vatsalya, madhurya, chanting, lust, anger, greed, vaidhi-bhakti, raganuga-bhakti, sadhana-bhakti, bhava-bhakti, prema-bhakti, uttama-bhakti, etc.
+Devotee qualification levels are CONCEPTS, not persons: uttamadhikari, madhyamadhikari, kanisthadhikari — these are categories, not named individuals. Use plain English lowercase (no diacritics) for concept names.
+Invalid: Adi Khanda, Madhya Khanda, chapter, section, part, division, book, khanda, introduction, prologue — these are structural labels, not ideas.
+Format: lowercase singular — "bhakti" not "Bhakti" or "bhaktis"; never include "the"
 
-══════════════════════════════════════════════════════
-ENTITY EXTRACTION — COMPLETE COVERAGE REQUIRED
-══════════════════════════════════════════════════════
-Extract EVERY entity clearly mentioned or strongly implied. Target 8–25 entities per verse.
+## EXAMPLE
 
+Input:
+[SB 10.3.9]
+Translation: O Lord, You are the source of the entire creation...
+Purport: Devaki recognizes Krishna as the Supreme Person and prays with great humility...
 
-ENTITY TYPES (extract from ALL categories, not just people):
- BEINGS: person, deva, demon, sage, animal
- GEOGRAPHY: place, river, mountain, kingdom, dynasty
- ABSTRACT: concept, object, text
+Output:
+{"entities":[{"name":"Krishna","sanskrit_name":"Kṛṣṇa","type":"deva","description":"The Supreme Personality of Godhead, source of all avatars and the original person.","aliases":[]},{"name":"Devaki","sanskrit_name":"Devakī","type":"person","description":"Mother of Krishna, wife of Vasudeva, imprisoned by her brother Kamsa.","aliases":[]},{"name":"humility","sanskrit_name":"vinaya","type":"concept","description":"The quality of being free from pride; a foundational virtue in Vaishnava practice.","aliases":[]}],"relationships":[{"source":"Devaki","target":"Krishna","type":"mother_of","context":"Devaki addresses Krishna at his birth","confidence":"high"},{"source":"Devaki","target":"Krishna","type":"worships","context":"Devaki prays to Krishna with humility","confidence":"high"}],"verse_summaries":[{"reference":"SB 10.3.9","entities_mentioned":[{"name":"Krishna","source":"verse"},{"name":"Devaki","source":"purport"}],"concepts":["humility"]}]}
 
+## OUTPUT — valid JSON only, no markdown fences
+{"entities":[...],"relationships":[...],"verse_summaries":[{"reference":"...","entities_mentioned":[{"name":"...","source":"verse|purport"}],"concepts":["..."]}]}
 
-Expected distribution (NOT a rule, but a guide):
- - Most verses: 2–5 people, 2–4 places/geography, 3–6 concepts, 1–2 objects
- - Some verses: more places if geographic narrative is prominent
- - Some verses: more concepts if philosophical discussion is primary
-
-
-CRITICAL: Descriptions must be UNIVERSAL KNOWLEDGE about the entity, NOT observations from this specific verse.
-✗ "The moon used as a metaphor in this verse"
-✓ "The celestial body orbiting Earth, symbol of beauty and coolness in Vaishnava poetry"
-
-
-For each entity:
-- name: canonical English name (no diacritics, no possessives)
-- sanskrit_name: full diacritic transliteration
-- type: from the list above
-- description: IMPORTANT: Write ONLY the canonical definition of this entity as universally understood in Vaishnava scripture. DO NOT mention this specific verse, this verse's metaphors, or how the entity is used here. Write as if describing it in an encyclopedia entry. Examples: "Krishna is the supreme personality of Godhead, the source of all avatars" NOT "Krishna appears in this verse as..."
-- aliases: all epithets and names for this entity mentioned in this verse/purport
-
-
-══════════════════════════════════════════════════════
-⚠️  GEOGRAPHIC ENTITIES — MANDATORY (MOST COMMONLY SKIPPED)
-══════════════════════════════════════════════════════
-Geographic locations are CRITICAL and OFTEN OMITTED. Extract them aggressively.
-
-
-PLACES (look for these in every verse):
- ✓ Holy cities: Vrindavan, Mathura, Dwarka, Kurukshetra, Ayodhya, Vaikuntha
- ✓ Kingdoms: Kamsa's kingdom, Yadava kingdom, Kuru kingdom
- ✓ Forests/regions: Naimisharanya, Govardhan forest, Vraja
- ✓ Temples/sacred sites: any named sacred location
- ✓ Realms: material world, spiritual world, Goloka
- ✓ Even vague places: "the arena", "the kingdom", "the forest" → extract as place
-
-
-RIVERS (never miss):
- ✓ Yamuna, Ganga, Godavari, Indus, Saraswati, any river mentioned
-
-
-MOUNTAINS (never miss):
- ✓ Govardhan, Himalaya, Meru, Mandara, any mountain mentioned
-
-
-CORRECT TYPE MAPPING:
- type="place"     → Cities, forests, regions, sacred sites, realms
- type="river"     → Any river (named or described)
- type="mountain"  → Any mountain (named or described)
- type="kingdom"   → Named kingdoms or ruled territories
-
-
-⚠️  COMMON MISTAKES TO AVOID:
- ✗ "Vaikuntha" as type="concept" — it's a PLACE
- ✗ "Yamuna" as type="object" — it's a RIVER
- ✗ Missing places because they're implied — EXTRACT THEM ANYWAY
- ✗ Treating geography as "world" or "realm" concept — use place type
-
-
-✓ CORRECT EXAMPLES:
- • Vrindavan → type="place", description="Sacred pastoral region in ancient India where Krishna performed his childhood pastimes"
- • Yamuna → type="river", description="Major river of northern India, sacred in Hinduism and site of Krishna's divine play"
- • Govardhan → type="mountain", description="Sacred mountain in Vrindavan, lifted by Krishna to protect the inhabitants"
- • Kurukshetra → type="place", description="Sacred battlefield in northern India, site of the Mahabharata war"
-
-
-══════════════════════════════════════════════════════
-RELATIONSHIP EXTRACTION — READ CAREFULLY
-══════════════════════════════════════════════════════
-DIRECTION RULE: "source [type] target" must read as a true sentence.
-Examples of correct direction:
- ✓ source="Vasudeva"  type="father_of"    target="Krishna"   → "Vasudeva is father of Krishna"
- ✓ source="Krishna"   type="son_of"       target="Vasudeva"  → "Krishna is son of Vasudeva"
- ✓ source="Krishna"   type="kills"        target="Kamsa"     → "Krishna kills Kamsa"
- ✓ source="Brahma"    type="guru_of"      target="Narada"    → "Brahma is guru of Narada"
- ✓ source="Arjuna"    type="devotee_of"   target="Krishna"   → "Arjuna is devotee of Krishna"
- ✗ source="Krishna"   type="killed_by"    target="Kamsa"     → WRONG DIRECTION (Krishna was NOT killed by Kamsa)
- ✗ source="Narada"    type="guru_of"      target="Brahma"    → WRONG (Brahma is Narada's guru, not the other way)
-
-
-Allowed relationship types (active voice where possible):
- father_of, mother_of, son_of, daughter_of, brother_of, sister_of, spouse_of,
- uncle_of, nephew_of, cousin_of, grandfather_of, grandson_of,
- guru_of, disciple_of, devotee_of, friend_of, enemy_of,
- incarnation_of, expansion_of, king_of, resident_of,
- kills, blesses, curses, commander_of
-
-
-SELF-VERIFICATION STEP (do this before writing final JSON):
-For each relationship you intend to include, ask yourself:
- "Does [source] [type] [target] state a true fact from Vaishnava scripture?"
- "Am I certain about the direction — is source really the one doing/being the relationship?"
-If you are uncertain, set confidence to "low" and reconsider whether to include it at all.
-
-
-Each relationship must include a "confidence" field: "high", "medium", or "low".
-- high: you are certain this is factually correct and correctly directed
-- medium: text implies it but does not state it explicitly
-- low: you are uncertain about the fact or direction
-
-
-══════════════════════════════════════════════════════
-CONCEPT EXTRACTION — aim for 8–20 per verse
-══════════════════════════════════════════════════════
-Extract ALL concepts present in verse + purport (use canonical names of concepts, not verse-specific wording):
-- Philosophical principles: bhakti, jnana, vairagya, karma, dharma, maya, moksha
-- Qualities/virtues: humility, compassion, patience, surrender, tapasya
-- Vices: pride, lust, anger, greed, envy, illusion
-- Theological: avatar, incarnation, expansion, vilasa, svamsa
-- Rasas: dasya, sakhya, vatsalya, madhurya, santa
-- Named pastimes, teachings, doctrines
-- Social/ethical principles
-
-
-Return ONLY the canonical concept name (e.g., "bhakti", not "the bhakti shown in this verse")
-
-
-══════════════════════════════════════════════════════
-OUTPUT — valid JSON only, no markdown, no extra text
-══════════════════════════════════════════════════════
-{
- "entities": [
-   {
-     "name": "canonical English name",
-     "sanskrit_name": "diacritic transliteration",
-     "type": "person|deva|demon|sage|place|river|mountain|kingdom|dynasty|concept|object|text|animal",
-     "description": "specific description from this verse/purport",
-     "aliases": ["alias1", "alias2"]
-   }
- ],
- "relationships": [
-   {
-     "source": "entity name exactly as listed in entities",
-     "target": "entity name exactly as listed in entities",
-     "type": "relationship_type",
-     "context": "brief quote or explanation from the text",
-     "confidence": "high|medium|low"
-   }
- ],
- "verse_summaries": [
-   {
-     "reference": "e.g. SB 1.1.1",
-     "entities_mentioned": [
-       {"name": "entity name", "source": "verse or purport"}
-     ],
-     "concepts": ["concept1", "concept2"]
-   }
- ]
-}
-
-
-If nothing can be confidently extracted: {"entities": [], "relationships": [], "verse_summaries": []}
+EMPTY RESULT: {"entities":[],"relationships":[],"verse_summaries":[]}
 """
 
 
@@ -518,6 +409,32 @@ def normalize_entity_name(name: str) -> str:
 
 
 
+def _filter_bad_aliases(aliases: list) -> list:
+    """Remove pronouns, articles, and generic words from aliases."""
+    bad_words = {
+        # Pronouns
+        'he', 'she', 'it', 'they', 'them', 'we', 'you', 'i', 'me', 'us', 'him', 'her',
+        # Articles/demonstratives
+        'the', 'a', 'an', 'this', 'that', 'these', 'those',
+        # Generic words
+        'author', 'speaker', 'person', 'god', 'lord', 'master', 'devotee', 'sage',
+        'man', 'woman', 'being', 'entity', 'one', 'someone', 'anyone', 'himself', 'herself',
+        # Common weak words
+        'self', 'own', 'other', 'same', 'such', 'very',
+    }
+
+    filtered = []
+    for alias in aliases:
+        if not isinstance(alias, str):
+            continue
+        clean = alias.strip().lower()
+        if clean and clean not in bad_words and len(clean) > 1:
+            filtered.append(alias.strip())
+    return list(dict.fromkeys(filtered))  # Remove duplicates while preserving order
+
+
+
+
 def normalize_extraction_result(result: dict) -> dict:
    """Apply name normalization to all entity names and relationship source/target."""
    name_map: dict[str, str] = {}
@@ -532,6 +449,8 @@ def normalize_extraction_result(result: dict) -> dict:
        name_map[orig] = canon
        name_map[orig.lower()] = canon
        ent["name"] = canon
+       # Filter bad aliases
+       ent["aliases"] = _filter_bad_aliases(ent.get("aliases", []))
        normalized_entities.append(ent)
    result["entities"] = normalized_entities
 
@@ -646,6 +565,7 @@ def _call_gemini(prompt: str) -> dict:
        config=genai_types.GenerateContentConfig(
            temperature=0.1,
            response_mime_type="application/json",
+           system_instruction=SYSTEM_PROMPT,
        ),
    )
    raw = response.text.strip()
@@ -662,7 +582,7 @@ def extract_from_verses(verses: list[dict], hint: str = "") -> dict:
    If hint is provided (retry context), it is appended to the prompt.
    """
    verse_blocks = "\n\n---\n\n".join(_build_verse_block(v) for v in verses)
-   prompt = f"{SYSTEM_PROMPT}\n\nVERSE TO ANALYZE:\n\n{verse_blocks}"
+   prompt = f"VERSE TO ANALYZE:\n\n{verse_blocks}"
    if hint:
        prompt += f"\n\n{hint}"
 
