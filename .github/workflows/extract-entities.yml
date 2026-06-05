@@ -28,7 +28,6 @@ jobs:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          cd vedikg-be
           echo "Starting extraction at $(date)"
           python extract_entities.py --all --limit 1
           echo "Extraction complete at $(date)"
