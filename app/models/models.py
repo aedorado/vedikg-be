@@ -211,6 +211,7 @@ class VerseConcept(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     verse_id = Column(Integer, ForeignKey("verses.id"), index=True)
-    concept = Column(String(255), index=True)  # e.g., "bhakti", "karma", "maya", "humility", "tolerance", "cleanliness"
+    concept_id = Column(Integer, ForeignKey("ai_entities.id"), index=True)
 
     verse = relationship("Verse", foreign_keys=[verse_id])
+    concept = relationship("Entity", foreign_keys=[concept_id])
