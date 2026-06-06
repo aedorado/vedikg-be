@@ -207,10 +207,12 @@ def list_ai_concepts(limit: int = 100000):
     cursor = conn.cursor()
     cursor.execute(
         """
-        SELECT c.concept, array_agg(v.id) AS verse_ids, array_agg(v.full_reference) AS verse_titles
-        FROM ai_verse_concepts c
-        JOIN verses v ON v.id = c.verse_id
-        GROUP BY c.concept
+        SELECT e.name, e.description, array_agg(v.id) AS verse_ids, array_agg(v.full_reference) AS verse_titles
+        FROM ai_verse_concepts vc
+        JOIN ai_entities e ON e.id = vc.concept_id
+        JOIN verses v ON v.id = vc.verse_id
+        WHERE e.entity_type = 'concept'
+        GROUP BY e.id, e.name, e.description
         ORDER BY COUNT(*) DESC
         LIMIT %s
         """,
@@ -221,8 +223,9 @@ def list_ai_concepts(limit: int = 100000):
     for r in rows:
         result.append({
             "concept": r[0],
-            "verse_ids": r[1],
-            "verse_titles": r[2],
+            "description": r[1],
+            "verse_ids": r[2],
+            "verse_titles": r[3],
         })
     cursor.close()
     conn.close()
@@ -278,12 +281,14 @@ def get_ai_entity(entity_id: int):
     rels_in = cursor.fetchall()
 
     cursor.execute("""
-        SELECT concept, COUNT(*) as freq
-        FROM ai_verse_concepts
-        WHERE verse_id IN (
+        SELECT e.name, COUNT(*) as freq
+        FROM ai_verse_concepts vc
+        JOIN ai_entities e ON e.id = vc.concept_id
+        WHERE vc.verse_id IN (
             SELECT verse_id FROM ai_verse_entities WHERE entity_id = %s
         )
-        GROUP BY concept
+        AND e.entity_type = 'concept'
+        GROUP BY e.id, e.name
         ORDER BY freq DESC
         LIMIT 40
     """, (entity_id,))
@@ -341,26 +346,28 @@ def list_ai_concepts(search: str | None = None, limit: int = 50, offset: int = 0
     conn = get_conn()
     cursor = conn.cursor()
 
-    search_clause = "WHERE LOWER(c.concept) LIKE %s" if search else ""
+    search_clause = "AND LOWER(e.name) LIKE %s" if search else ""
     search_params = [f"%{search.lower()}%"] if search else []
 
     cursor.execute(f"""
-        SELECT c.concept,
-               COUNT(*) AS verse_count,
-               e.id AS entity_id,
+        SELECT e.id,
+               e.name,
+               COUNT(DISTINCT vc.verse_id) AS verse_count,
                e.description
-        FROM ai_verse_concepts c
-        LEFT JOIN ai_entities e
-          ON LOWER(e.name) = LOWER(c.concept) AND e.entity_type = 'concept'
+        FROM ai_entities e
+        LEFT JOIN ai_verse_concepts vc ON vc.concept_id = e.id
+        WHERE e.entity_type = 'concept'
         {search_clause}
-        GROUP BY c.concept, e.id, e.description
+        GROUP BY e.id, e.name, e.description
         ORDER BY verse_count DESC
         LIMIT %s OFFSET %s
     """, search_params + [limit, offset])
     rows = cursor.fetchall()
 
     cursor.execute(f"""
-        SELECT COUNT(DISTINCT c.concept) FROM ai_verse_concepts c {search_clause}
+        SELECT COUNT(DISTINCT e.id) FROM ai_entities e
+        WHERE e.entity_type = 'concept'
+        {search_clause}
     """, search_params)
     total = cursor.fetchone()[0]
 
@@ -369,9 +376,9 @@ def list_ai_concepts(search: str | None = None, limit: int = 50, offset: int = 0
     return {
         "items": [
             {
-                "concept": r[0],
-                "verse_count": r[1],
-                "entity_id": r[2],
+                "entity_id": r[0],
+                "concept": r[1],
+                "verse_count": r[2],
                 "description": r[3],
             }
             for r in rows
@@ -390,18 +397,17 @@ def get_ai_concept(slug: str):
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT c.concept,
+        SELECT e.id,
+               e.name,
+               e.description,
                array_agg(v.id ORDER BY v.id)               AS verse_ids,
                array_agg(v.full_reference ORDER BY v.id)    AS verse_refs,
-               array_agg(v.translation ORDER BY v.id)       AS translations,
-               e.id AS entity_id,
-               e.description
-        FROM ai_verse_concepts c
-        JOIN verses v ON v.id = c.verse_id
-        LEFT JOIN ai_entities e
-          ON LOWER(e.name) = LOWER(c.concept) AND e.entity_type = 'concept'
-        WHERE LOWER(c.concept) = LOWER(%s)
-        GROUP BY c.concept, e.id, e.description
+               array_agg(v.translation ORDER BY v.id)       AS translations
+        FROM ai_entities e
+        LEFT JOIN ai_verse_concepts vc ON vc.concept_id = e.id
+        LEFT JOIN verses v ON v.id = vc.verse_id
+        WHERE e.entity_type = 'concept' AND LOWER(e.name) = LOWER(%s)
+        GROUP BY e.id, e.name, e.description
     """, (concept_name,))
     row = cursor.fetchone()
     cursor.close()
@@ -412,12 +418,12 @@ def get_ai_concept(slug: str):
         raise HTTPException(status_code=404, detail="Concept not found")
 
     return {
-        "concept": row[0],
-        "verse_ids": row[1],
-        "verse_titles": row[2],
-        "translations": row[3],
-        "entity_id": row[4],
-        "description": row[5],
+        "entity_id": row[0],
+        "concept": row[1],
+        "description": row[2],
+        "verse_ids": row[3],
+        "verse_titles": row[4],
+        "translations": row[5],
     }
 
 
@@ -510,7 +516,7 @@ def ai_progress():
     total_relationships = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(DISTINCT verse_id) FROM ai_verse_entities")
     total_verse_links = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(DISTINCT concept) FROM ai_verse_concepts")
+    cursor.execute("SELECT COUNT(DISTINCT concept_id) FROM ai_verse_concepts")
     total_concepts = cursor.fetchone()[0]
 
     cursor.execute("""
