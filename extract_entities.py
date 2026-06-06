@@ -122,7 +122,7 @@ def db_get_or_create_entity(cursor, name: str, entity_type: str,
         cursor.execute("""
             UPDATE ai_entities SET
                 mention_count = mention_count + 1,
-                description = CASE WHEN description IS NULL OR description = '' THEN %s ELSE description END
+                description = %s
             WHERE id = %s
         """, (description or "", entity_id))
         _merge_alias(cursor, entity_id, name)
@@ -138,7 +138,12 @@ def db_get_or_create_entity(cursor, name: str, entity_type: str,
             best_id = cand_id
 
     if best_id:
-        cursor.execute("UPDATE ai_entities SET mention_count = mention_count + 1 WHERE id = %s", (best_id,))
+        cursor.execute("""
+            UPDATE ai_entities SET
+                mention_count = mention_count + 1,
+                description = %s
+            WHERE id = %s
+        """, (description or "", best_id))
         _merge_alias(cursor, best_id, name)
         return best_id
 
@@ -147,17 +152,40 @@ def db_get_or_create_entity(cursor, name: str, entity_type: str,
     if sanskrit_name and ascii_fold(sanskrit_name) != name:
         all_aliases.append(sanskrit_name)
 
-    cursor.execute("""
-        INSERT INTO ai_entities
-            (name, normalized_name, entity_type, description,
-             aliases_json, sanskrit_name, first_seen_verse_id, mention_count)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
-        RETURNING id
-    """, (name, normalized, entity_type, description or "",
-          json.dumps(all_aliases), sanskrit_name or "", verse_id))
-    entity_id = cursor.fetchone()[0]
-    _cache_add(entity_id, normalized, entity_type)
-    return entity_id
+    try:
+        cursor.execute("""
+            INSERT INTO ai_entities
+                (name, normalized_name, entity_type, description,
+                 aliases_json, sanskrit_name, first_seen_verse_id, mention_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
+            RETURNING id
+        """, (name, normalized, entity_type, description or "",
+              json.dumps(all_aliases), sanskrit_name or "", verse_id))
+        entity_id = cursor.fetchone()[0]
+        _cache_add(entity_id, normalized, entity_type)
+        return entity_id
+    except Exception as e:
+        if "unique" in str(e).lower() and "normalized_name" in str(e).lower():
+            # Entity already exists in DB but not in cache — recover by updating
+            logger.warning(f"Entity '{name}' already in DB (cache miss) — updating instead")
+            # Rollback failed transaction before executing recovery query
+            cursor.connection.rollback()
+            cursor.execute("""
+                SELECT id FROM ai_entities WHERE normalized_name = %s
+            """, (normalized,))
+            row = cursor.fetchone()
+            if row:
+                entity_id = row[0]
+                cursor.execute("""
+                    UPDATE ai_entities SET
+                        mention_count = mention_count + 1,
+                        description = %s
+                    WHERE id = %s
+                """, (description or "", entity_id))
+                _cache_add(entity_id, normalized, entity_type)
+                _merge_alias(cursor, entity_id, name)
+                return entity_id
+        raise
 
 
 def _merge_alias(cursor, entity_id: int, new_alias: str):
@@ -199,32 +227,60 @@ def db_get_or_create_relationship(cursor, src_id: int, tgt_id: int,
 
 
 def db_link_verse_entity(cursor, verse_id: int, entity_id: int, mention_source: str = "verse"):
-    """Link verse to entity. ON CONFLICT: update mention_source."""
+    """Link verse to entity. ON CONFLICT: merge mention_source values to 'both' if different."""
     try:
         cursor.execute("""
             INSERT INTO ai_verse_entities (verse_id, entity_id, mention_source)
             VALUES (%s, %s, %s)
-            ON CONFLICT (verse_id, entity_id) DO UPDATE SET mention_source = EXCLUDED.mention_source
+            ON CONFLICT (verse_id, entity_id) DO UPDATE SET 
+                mention_source = CASE
+                    WHEN EXCLUDED.mention_source = 'both' THEN 'both'
+                    WHEN EXCLUDED.mention_source = ai_verse_entities.mention_source THEN EXCLUDED.mention_source
+                    ELSE 'both'
+                END
         """, (verse_id, entity_id, mention_source))
     except Exception:
         pass  # silently skip if constraint not set up for ON CONFLICT
 
 
 def db_save_verse_concepts(cursor, verse_id: int, concepts: list) -> int:
+    """Save concepts as entities (type='concept') and link to verse.
+    Expects concepts in new format: [{"name": "bhakti", "description": "..."}, ...]
+    Also handles legacy format: ["bhakti", "maya", ...] for backwards compat.
+    """
     count = 0
-    for concept in concepts:
-        concept = concept.strip().lower() if isinstance(concept, str) else ""
-        if not concept:
+    for concept_item in concepts:
+        # Handle both dict format (new) and string format (legacy)
+        if isinstance(concept_item, dict):
+            concept_name = concept_item.get("name", "").strip().lower()
+            concept_desc = concept_item.get("description", "").strip()
+        else:
+            concept_name = str(concept_item).strip().lower() if concept_item else ""
+            concept_desc = ""
+
+        if not concept_name:
             continue
+
         try:
+            # Create/upsert concept as entity with type='concept'
+            concept_id = db_get_or_create_entity(
+                cursor, concept_name, "concept",
+                description=concept_desc,
+                aliases=[],
+                sanskrit_name=None,
+                verse_id=verse_id
+            )
+
+            # Link concept entity to verse
             cursor.execute("""
-                INSERT INTO ai_verse_concepts (verse_id, concept)
+                INSERT INTO ai_verse_concepts (verse_id, concept_id)
                 VALUES (%s, %s)
-                ON CONFLICT DO NOTHING
-            """, (verse_id, concept))
+                ON CONFLICT (verse_id, concept_id) DO NOTHING
+            """, (verse_id, concept_id))
             count += 1
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to save concept '{concept_name}': {e}")
+
     return count
 
 
@@ -281,6 +337,10 @@ def _do_save(verses: list, result: dict) -> dict:
                 cursor, name, etype, desc, aliases, sanskrit, first_verse_id
             )
 
+            if desc:
+                desc_preview = desc[:80] if len(desc) > 80 else desc
+                logger.info(f"     → saved to DB: desc='{desc_preview}...'")
+
             entity_name_to_id[name] = entity_id
             entity_name_to_id[name.lower()] = entity_id
             entity_name_to_id[norm] = entity_id
@@ -313,10 +373,10 @@ def _do_save(verses: list, result: dict) -> dict:
             if created:
                 stats["relationships_created"] += 1
 
-        # 3. Link ALL extracted entities to the verse (not just from summaries)
+        # 3. Link entities with their mention source (verse/purport/both)
+        # Source is now directly on each entity dict from Stage 1
         verse = verses[0] if verses else None
         if verse:
-            # Link entities from main entities list
             for entity_data in result.get("entities", []):
                 ename = entity_data.get("name", "").strip()
                 if not ename:
@@ -329,16 +389,17 @@ def _do_save(verses: list, result: dict) -> dict:
                     entity_id = _NORM_TO_ID.get(canonical_normalized(ename))
 
                 if entity_id:
-                    db_link_verse_entity(cursor, verse["id"], entity_id, "verse")
+                    mention_source = entity_data.get("source", "verse")
+                    if mention_source not in ("verse", "purport", "both"):
+                        logger.warning(f"  ⚠️  Invalid source '{mention_source}' for '{ename}', defaulting to 'verse'")
+                        mention_source = "verse"
+                    db_link_verse_entity(cursor, verse["id"], entity_id, mention_source)
                     stats["mentions_created"] += 1
 
-        # 4. Save concepts from verse summaries
-        for vs_summary in result.get("verse_summaries", []):
-            verse = verse_map.get(vs_summary.get("reference", ""))
-            if not verse:
-                continue
-
-            concepts = vs_summary.get("concepts", [])
+        # 4. Save concepts (flat list from Stage 3 result)
+        verse = verses[0] if verses else None
+        if verse:
+            concepts = result.get("concepts", [])
             if concepts:
                 stats["concepts_created"] += db_save_verse_concepts(cursor, verse["id"], concepts)
 
@@ -463,7 +524,7 @@ def get_verses_to_process(book_code: str | None = None,
         JOIN books bk    ON bk.id = v.book_id
         {where_clause}
         ORDER BY v.id
-        LIMIT 50000
+        LIMIT 500
     """
     cursor.execute(query, params)
     rows = cursor.fetchall()
@@ -487,28 +548,40 @@ def process_verses(verses: list, dry_run: bool = False, reprocess: bool = False)
 
     for i, verse in enumerate(verses):
         ref = verse["full_reference"]
-        logger.info(f"[{i+1}/{total}] Extracting: {ref}")
+        logger.info(f"\n{'='*70}")
+        logger.info(f"[{i+1}/{total}] Processing: {ref}")
+        logger.info(f"{'='*70}")
 
         result = extract_with_retry([verse])
 
         entities = result.get("entities", [])
         relationships = result.get("relationships", [])
-        summaries = result.get("verse_summaries", [])
+        concepts = result.get("concepts", [])
 
-        logger.info(f"  → {len(entities)} entities, {len(relationships)} rels, "
-                    f"{len(summaries)} summaries")
+        logger.info(f"\n📊 EXTRACTION RESULT:")
+        logger.info(f"   ✓ {len(entities)} entities, {len(relationships)} rels, {len(concepts)} concepts")
 
-        # Log quota status after every verse
+        if entities:
+            logger.info(f"\n📝 ENTITIES EXTRACTED:")
+            for e in entities:
+                src = e.get("source", "?")
+                typ = e.get("type", "?")
+                logger.info(f"   • [{typ:8s}] {e.get('name'):25s} (source={src:7s}) → {e.get('description','')}")
+
+        if relationships:
+            logger.info(f"\n🔗 RELATIONSHIPS EXTRACTED:")
+            for r in relationships:
+                logger.info(f"   • {r.get('source')} --[{r.get('type')}]--> {r.get('target')}")
+
+        if concepts:
+            logger.info(f"\n💡 CONCEPTS EXTRACTED: {concepts}")
+
+        logger.info(f"\n📈 API QUOTA STATUS:")
         try:
             pool = get_pool()
             pool.log_quota_status()
         except Exception as e:
             logger.warning(f"Could not log quota status: {e}")
-
-        if entities:
-            for e in entities:
-                logger.info(f"    [{e.get('type')}] {e.get('name')} | "
-                            f"aliases={e.get('aliases', [])} | {e.get('description', '')[:80]}")
 
         if dry_run:
             logger.info("  [dry-run] skipping DB write")
@@ -517,10 +590,8 @@ def process_verses(verses: list, dry_run: bool = False, reprocess: bool = False)
         if reprocess:
             conn = get_conn()
             cur = conn.cursor()
-            cur.execute("""
-                DELETE FROM ai_verse_entities WHERE verse_id = %s;
-                DELETE FROM ai_verse_concepts WHERE verse_id = %s;
-            """, (verse["id"], verse["id"]))
+            cur.execute("DELETE FROM ai_verse_entities WHERE verse_id = %s", (verse["id"],))
+            cur.execute("DELETE FROM ai_verse_concepts WHERE verse_id = %s", (verse["id"],))
             conn.commit()
             cur.close()
             conn.close()
@@ -606,6 +677,7 @@ def main():
             chapter_num=chapter_num,
             reprocess=args.reprocess,
         )
+        logger.info(f"Found {len(verses)} to process")
 
         if verses:
             process_verses(verses, dry_run=args.dry_run, reprocess=args.reprocess)
