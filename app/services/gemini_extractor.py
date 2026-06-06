@@ -1,18 +1,16 @@
 """
 Gemini-powered entity & relationship extractor for Bhagavatam texts.
 
-
 Key pool: set GEMINI_API_KEYS=key1,key2,key3 in .env
 Per key limits: 15 RPM, 500 RPD
-The pool rotates so the daily budget is never exhausted.
 
+Multi-stage extraction pipeline (3 API calls per verse):
+  Stage 1 — Entities + Concepts:  what is explicitly named/discussed and where (verse vs purport)
+  Stage 2 — Relationships:        links between only the entities identified in stage 1
+  Stage 3 — Verification:         catches type errors, wrong directions, unsupported claims
 
-Relationship quality:
-- Each relationship carries a "confidence": high | medium | low field.
-- The model self-checks every relationship before returning.
-- If any low-confidence relationships remain after extraction, the verse is
- retried (up to MAX_VERIFY_RETRIES times) with a hint listing the suspicious
- relationships so the model can re-examine them.
+Results are assembled in memory first, then saved atomically.
+Accuracy over quantity — only high-confidence, explicitly-stated facts.
 """
 
 
@@ -39,9 +37,7 @@ logger = logging.getLogger(__name__)
 
 RPM_LIMIT = 15
 RPD_LIMIT = 500
-MAX_VERIFY_RETRIES = 2   # extra attempts when low-confidence rels are found
-HOURS_TO_RUN = 24  # spread requests over this many hours (24 = full day, 8 = business hours)
-# REQUEST_DELAY_SECONDS is calculated dynamically based on number of keys
+HOURS_TO_RUN = 12
 
 
 
@@ -275,119 +271,172 @@ CANONICAL_NAMES: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Prompt — compact system instruction + worked example
+# Stage prompts — focused, constrained, no ambiguity
 # ---------------------------------------------------------------------------
 
+# Book authorship preamble shared across stages
+_BOOK_CONTEXT = """BOOK AUTHORSHIP — when the text uses "I", the author is:
+- BRS (Bhakti-rasamrta-sindhu) → Rupa Goswami
+- CC (Caitanya-caritamrta) → Krishnadasa Kaviraja Goswami
+- CB (Caitanya Bhagavata) → Vrindavana Dasa Thakura
+- SB (Srimad-Bhagavatam) → compiled by Vyasa; narrated by Sukadeva to Parikshit"""
 
-SYSTEM_PROMPT = """You are an expert Vaishnava scholar (SB, CC, CB, BRS). Given ONE verse with translation and purport, extract entities, relationships, and concepts.
+_CANONICAL_MAPPINGS = """CANONICAL NAME MAPPINGS (always use these exact English names):
+- Krsna / Govinda / Madhusudana / Vasudeva / Murari / Hari → "Krishna"
+- Caitanya / Gauranga / Mahaprabhu / Gauracandra → "Chaitanya Mahaprabhu"
+- Siva / Mahadeva / Sankara / Rudra → "Shiva"
+- Narada / Nārada → "Narada"
+- Vyasa / Vyasadeva / Vedavyasa → "Vyasa"
+- Sukadeva / Suka / Śukadeva → "Sukadeva"
+- Parikshit / Parīkṣit → "Parikshit"
+- Nityananda / Nityānanda → "Nityananda"
+- Lakshmi / Lakṣmī → "Lakshmi"
+- Narayana / Nārāyaṇa → "Narayana"
+name format: plain English, no diacritics, no possessives (e.g. "Krishna" not "Kṛṣṇa" or "Krishna's")
+sanskrit_name: full diacritics (e.g. "Kṛṣṇa")"""
 
-## BOOK CONTEXT — AUTHOR IDENTIFICATION
-The verse reference prefix tells you who the author/speaker is when the text uses "I":
-- BRS (Bhakti-rasamrta-sindhu) → author is **Rupa Goswami**
-- CC (Caitanya-caritamrta) → author is **Krishnadasa Kaviraja Goswami**
-- CB (Caitanya Bhagavata) → author is **Vrindavana Dasa Thakura**
-- SB (Srimad-Bhagavatam) → compiled by Vyasa; narrated by Sukadeva to Parikshit
+STAGE1_SYSTEM = f"""You are an expert Gaudiya Vaishnava scholar. Your task: identify named entities and spiritual concepts from a scripture verse and its purport.
 
-When a verse uses first-person ("I offer my respects", "I have undertaken this work", "I am ignorant"), extract the author as an entity and add a relationship like `authored_by` or `worships` as appropriate.
+{_BOOK_CONTEXT}
 
-## NAMES
-- "name": plain English, no diacritics, no possessives — "Krishna" not "Kṛṣṇa" or "Krishna's"
-- "sanskrit_name": full diacritics
-- Same canonical name everywhere (entities, relationships, verse_summaries)
-- Canonical mappings:
-  Krsna/Govinda/Madhusudana/Vasudeva/Murari/Hari → "Krishna"
-  Visnu/Narayana/Hari(Narayana context) → "Vishnu"
-  Brahma/Brahmā → "Brahma"
-  Siva/Mahadeva/Sankara/Rudra → "Shiva"
-  Nārada → "Narada" | Vyāsa/Vyasadeva → "Vyasa" | Śukadeva/Suka → "Sukadeva"
-  Parīkṣit → "Parikshit" | Caitanya/Gauranga/Gauracandra → "Chaitanya Mahaprabhu"
+{_CANONICAL_MAPPINGS}
 
-## ENTITY TYPES
-Extract only entities that are clearly and meaningfully present. Fewer accurate entities are better than many uncertain ones — if you are not confident an entity belongs, omit it.
+━━━ ENTITY RULES ━━━
+1. Extract ONLY entities EXPLICITLY named in the text. If you are not certain — omit it.
+   Zero entities is a valid, correct result.
+2. No generics. These are INVALID entities: "a devotee", "the scripture", "the Lord" (without clear identity),
+   "a king", "the speaker", "the author". If a specific name is not given, do not create an entity.
+3. SOURCE ANNOTATION — for each entity, mark exactly where it appears:
+   • "source": "verse"   → named ONLY in the Sanskrit verse / Translation line (NOT in Purport)
+   • "source": "purport" → named ONLY in the Purport commentary (NOT in verse/translation)
+   • "source": "both"    → named in BOTH verse/translation AND purport
+   
+   EXAMPLES:
+   ✓ If verse says "Krishna" and purport also mentions "Krishna" → source: "both"
+   ✓ If only the verse translation says "Krishna" but purport doesn't mention it → source: "verse"
+   ✓ If only the purport describes "Radha" but the verse doesn't name her → source: "purport"
+   
+   This field is MANDATORY. Always include it.
+4. Entity types — choose exactly one:
+   • person   — named individual humans (historical, devotees, kings)
+   • deva     — gods and divine beings
+   • sage     — rishis, munis, acharyas
+   • demon    — asuras, rakshasas
+   • place    — cities, forests, spiritual realms, planets
+   • river    — named rivers
+   • mountain — named mountains
+   • kingdom  — ruled territories
+   • dynasty  — ruling lineages
+   • text     — any named written work (scripture, purana, smriti, gita, etc.)
+   • object   — significant physical items (weapons, ornaments, etc.)
+   • group    — named collectives (Pracetas, Kauravas, Siddhas, etc.)
+5. description: 1 or 2 sentences of canonical Gaudiya Vaishnava encyclopedic knowledge about this entity.
+   Include: who they are, their role/significance in Gaudiya Vaishnava tradition, and key relationships.
+   NEVER reference this specific verse. Write as if for a comprehensive reference encyclopedia.
+6. aliases: ONLY alternate names that appear EXPLICITLY in THIS text. Do not add well-known aliases
+   from general knowledge that are absent from the passage.
 
-| type | notes |
-|------|-------|
-| person | named humans only — NOT devotee categories or archetypes |
-| deva | gods/divine beings |
-| demon | asuras, rakshasas |
-| sage | rishis, munis |
-| animal | named animals only |
-| place | cities, forests, realms — Vrindavan, Vaikuntha, spiritual world ARE places, NOT concepts |
-| river | any named river |
-| mountain | any named mountain |
-| kingdom | ruled territories |
-| dynasty | ruling lineages |
-| concept | philosophical ideas, virtues, vices, spiritual practices — NOT book divisions/chapters/sections |
-| object | significant physical items |
-| text | scriptural works |
+━━━ CONCEPT RULES ━━━
+1. Concepts = philosophical/spiritual ideas, practices, qualities, states of being.
+2. VALID concepts: bhakti, jnana, karma, maya, dharma, moksha, lila, rasa, vairagya, surrender,
+   humility, detachment, chanting, devotion, liberation, austerity, renunciation, bhava-bhakti,
+   prema, dasya, sakhya, vatsalya, madhurya, sadhana, qualification, initiation, purity, etc.
+3. NOT concepts (do not list these): person names, text titles, place names, chapter/book/section
+   structural labels (khanda, chapter, division, part, prologue, introduction).
+4. Format: lowercase singular, no diacritics — "bhakti" not "Bhakti" or "bhaktis".
+5. For each concept, provide: name (lowercase, no diacritics) + description (1–2 sentences explaining
+   the concept in Gaudiya Vaishnava context, independent of this specific verse).
+6. List only concepts clearly present or discussed in this specific text.
 
-**description**: Gaudiya Vaishava specific encyclopedic knowledge about this entity — never specific to this verse. Keep to 1–2 sentences.
-**aliases**: ONLY alternate names that explicitly appear in this verse or purport text. Do not add well-known aliases that are absent from the passage.
-
-## RELATIONSHIPS
-Extract ONLY what is explicitly stated or clearly implied in THIS text. Do NOT add general scriptural knowledge absent from the passage.
-If no clear relationship exists between two entities, DO NOT invent one — it is better to have zero relationships than a forced or wrong one.
-
-"source [type] target" must be a true statement — direction matters.
-✓ source="Devaki" type="mother_of" target="Krishna"
-✗ source="Kamsa" type="killed_by" target="Krishna" (passive voice — wrong)
-
-Preferred types (you may invent a precise type if none fits):
-- Family: father_of, mother_of, son_of, daughter_of, brother_of, sister_of, spouse_of, uncle_of, nephew_of, cousin_of, grandfather_of, grandson_of, stepfather_of, stepmother_of, father_in_law_of, adopted_son_of
-- Spiritual: guru_of, disciple_of, devotee_of, servant_of, friend_of, enemy_of, worships, surrenders_to, takes_shelter_of, glorifies, prays_to, initiated_by
-- Action: kills, blesses, curses, instructs, rescues, protects, liberates, sends, receives, steals, imprisons, defeats, grants_boon_to
-- Role/identity: king_of, minister_of, commander_of, resident_of, incarnation_of, expansion_of, avatar_of, manifests_as, rules_over, born_in, located_in, authored_by, associated_with
-
-Confidence: high = explicit in text; medium = clearly implied; low = omit entirely
-
-## ENTITY QUALITY
-Do NOT extract vague catch-all entities. These are the most common offenders:
-- "scripture" / "the scriptures" → extract the SPECIFIC named text (Skanda Purana, Bhagavad Gita) OR skip it; "scripture" as a generic node produces meaningless relationships
-- "devotee", "the practitioner", "a person", "one who" → these describe a category, not a named individual; extract the concept instead (e.g. "uttamādhikārī" as a concept)
-- "the Lord", "the Supreme" without context → resolve to the specific deity only if the passage makes it unambiguous; if it could be Krishna or Vishnu or another, skip the entity rather than guess
-
-A generic entity as a relationship source/target is a red flag — if you find yourself writing `source="scripture"`, stop and reconsider.
-
-## CONCEPTS
-Valid: bhakti, jnana, karma, maya, dharma, moksha, lila, rasa, vairagya, austerity, humility, surrender, attachment, detachment, pride, compassion, dasya, sakhya, vatsalya, madhurya, chanting, lust, anger, greed, vaidhi-bhakti, raganuga-bhakti, sadhana-bhakti, bhava-bhakti, prema-bhakti, uttama-bhakti, etc.
-Devotee qualification levels are CONCEPTS, not persons: uttamadhikari, madhyamadhikari, kanisthadhikari — these are categories, not named individuals. Use plain English lowercase (no diacritics) for concept names.
-Invalid: Adi Khanda, Madhya Khanda, chapter, section, part, division, book, khanda, introduction, prologue — these are structural labels, not ideas.
-Format: lowercase singular — "bhakti" not "Bhakti" or "bhaktis"; never include "the"
-
-## EXAMPLE
-
-Input:
-[SB 10.3.9]
-Translation: O Lord, You are the source of the entire creation...
-Purport: Devaki recognizes Krishna as the Supreme Person and prays with great humility...
-
-Output:
-{"entities":[{"name":"Krishna","sanskrit_name":"Kṛṣṇa","type":"deva","description":"The Supreme Personality of Godhead, source of all avatars and the original person.","aliases":[]},{"name":"Devaki","sanskrit_name":"Devakī","type":"person","description":"Mother of Krishna, wife of Vasudeva, imprisoned by her brother Kamsa.","aliases":[]},{"name":"humility","sanskrit_name":"vinaya","type":"concept","description":"The quality of being free from pride; a foundational virtue in Vaishnava practice.","aliases":[]}],"relationships":[{"source":"Devaki","target":"Krishna","type":"mother_of","context":"Devaki addresses Krishna at his birth","confidence":"high"},{"source":"Devaki","target":"Krishna","type":"worships","context":"Devaki prays to Krishna with humility","confidence":"high"}],"verse_summaries":[{"reference":"SB 10.3.9","entities_mentioned":[{"name":"Krishna","source":"verse"},{"name":"Devaki","source":"purport"}],"concepts":["humility"]}]}
-
-## OUTPUT — valid JSON only, no markdown fences
-{"entities":[...],"relationships":[...],"verse_summaries":[{"reference":"...","entities_mentioned":[{"name":"...","source":"verse|purport"}],"concepts":["..."]}]}
-
-EMPTY RESULT: {"entities":[],"relationships":[],"verse_summaries":[]}
-"""
+━━━ OUTPUT ━━━
+Valid JSON only, no markdown fences, no explanation:
+{{"entities":[{{"name":"...","sanskrit_name":"...","type":"...","description":"...","aliases":[],"source":"verse|purport|both"}}],"concepts":[{{"name":"...","description":"..."}}]}}
+EMPTY RESULT: {{"entities":[],"concepts":[]}}"""
 
 
-RETRY_HINT_TEMPLATE = """
-IMPORTANT — Your previous extraction had these uncertain or potentially incorrect relationships:
-{flagged}
+STAGE2_SYSTEM = f"""You are an expert Gaudiya Vaishnava scholar. Your task: extract relationships between entities in a scripture verse.
+
+You will receive: the verse + purport text, and the list of entities already identified.
+
+{_BOOK_CONTEXT}
+
+━━━ RULES ━━━
+1. You may ONLY form relationships between entities in the PROVIDED ENTITY LIST.
+   Do NOT introduce any new entity names.
+2. Extract ONLY relationships explicitly stated or unmistakably implied by THIS text.
+   Do NOT use general scriptural knowledge — only what this specific passage says.
+3. Direction: "source [type] target" must be a literally true sentence.
+   ✓ source="Devaki" type="mother_of" target="Krishna"
+   ✗ source="Kamsa" type="killed_by" target="Krishna" — wrong direction (passive voice trap)
+
+━━━ HARD TYPE CONSTRAINTS — NEVER violate these ━━━
+• authored_by  → target MUST be a TEXT entity. A person cannot author a concept, another person,
+                 a place, or a dynasty. ✗ "Rupa Goswami authored_by bhakti" is WRONG.
+• cites        → use when a person or text quotes/references a text they did NOT write.
+                 Do NOT use authored_by for citing someone else's work.
+• worships / prays_to / surrenders_to / takes_shelter_of
+               → target MUST be a person/deva/sage. NEVER a concept or text.
+                 ✗ "Rupa Goswami worships bhava-bhakti" is WRONG (bhava-bhakti is a concept).
+• glorifies    → target MUST be a person/deva/sage. If the text praises a concept or practice,
+                 there is no relationship to extract — that is a concept, handled in Stage 1.
+• devotee_of   → target MUST be a deva or sage. Not a text or concept.
+
+━━━ RELATIONSHIP TYPE REFERENCE ━━━
+Family:   father_of, mother_of, son_of, daughter_of, brother_of, sister_of, spouse_of,
+          uncle_of, nephew_of, grandfather_of, grandson_of
+Spiritual: guru_of, disciple_of, devotee_of, servant_of, friend_of, enemy_of,
+           worships, surrenders_to, glorifies, prays_to, initiated_by
+Action:   kills, blesses, curses, instructs, rescues, defeats, grants_boon_to
+Role:     king_of, resident_of, incarnation_of, expansion_of, authored_by, cites, rules_over
+
+Zero relationships is a valid and often correct result. Never force a relationship.
+
+━━━ OUTPUT ━━━
+Valid JSON only, no markdown fences, no explanation:
+{{"relationships":[{{"source":"...","target":"...","type":"...","context":"exact phrase from text supporting this"}}]}}
+EMPTY RESULT: {{"relationships":[]}}"""
 
 
-Please re-examine the verse and purport carefully for each of these.
-Ask yourself: "Does [source] [type] [target] state a TRUE fact from Vaishnava scripture, in the correct direction?"
-- If the fact is correct but direction is wrong, swap source and target.
-- If you are still uncertain, remove the relationship entirely rather than guessing.
-- Only include relationships with confidence "high" or "medium".
-"""
+STAGE3_SYSTEM = """You are a strict quality-control reviewer for Vaishnava scripture extraction.
 
+You will receive: the original verse + purport AND an extraction result (entities, relationships, concepts).
 
+Review every item against the original text. Apply ALL checks below and return a corrected result.
+
+━━━ ENTITY CHECKS ━━━
+✓ PRESERVE all entity fields EXACTLY (unless there is a mistake): name, type, description, aliases, source, sanskrit_name
+  (description: keep from Stage 1 output unchanged — do not regenerate or modify)
+✗ Entity NOT explicitly named in the verse or purport → REMOVE
+✗ Entity type wrong (e.g., a text classified as "person", a concept as "deva") → FIX type
+✗ Source annotation wrong ("verse"/"purport"/"both") → FIX (compare against original text & check if the entity is mentioned in the verse or the purport or both)
+✗ Generic or vague name ("a king", "the devotee", "the speaker") → REMOVE
+
+━━━ RELATIONSHIP CHECKS ━━━
+✗ source or target name NOT in the entity list → REMOVE
+✗ "authored_by" where target is not a text entity → REMOVE
+✗ "worships / glorifies / prays_to / surrenders_to / takes_shelter_of" where target is a concept
+   or text entity → REMOVE
+✗ Relationship not clearly supported by the text → REMOVE
+✗ Wrong direction (passive voice confused, e.g. killed_by vs kills) → FIX direction or REMOVE if unsure
+✗ Author cites a text they did not write, but relationship says "authored_by" → CHANGE to "cites"
+
+━━━ CONCEPT CHECKS ━━━
+✓ PRESERVE all concept fields EXACTLY: name, description (do not regenerate descriptions — keep from Stage 1)
+✗ Named entity (person, place, text) listed as a concept → REMOVE
+✗ Structural label (chapter, book, section, khanda, division, part, introduction) → REMOVE
+✗ Missing description field → ADD a 1–2 sentence description of the concept
+✗ Duplicates → DEDUPLICATE
+
+If everything is already correct, return the input unchanged.
+
+━━━ OUTPUT ━━━
+Valid JSON only, no markdown fences, no explanation.
+For EACH entity, include ALL fields: name, type, description, aliases, source, sanskrit_name.
+{"entities":[{"name":"...","type":"...","description":"...","aliases":[],"source":"verse|purport|both","sanskrit_name":"..."}],"relationships":[...],"concepts":[{"name":"...","description":"..."}]}"""
 
 
 # ---------------------------------------------------------------------------
-# Name normalization helpers
+# Name normalization helpers (canonical mappings applied after extraction)
 # ---------------------------------------------------------------------------
 
 
@@ -436,9 +485,9 @@ def _filter_bad_aliases(aliases: list) -> list:
 
 
 def normalize_extraction_result(result: dict) -> dict:
-   """Apply name normalization to all entity names and relationship source/target."""
+   """Normalize entity names and relationship source/target using canonical mappings.
+   Also normalize concepts to ensure they have name + description."""
    name_map: dict[str, str] = {}
-
 
    normalized_entities = []
    for ent in result.get("entities", []):
@@ -449,14 +498,12 @@ def normalize_extraction_result(result: dict) -> dict:
        name_map[orig] = canon
        name_map[orig.lower()] = canon
        ent["name"] = canon
-       # Filter bad aliases
        ent["aliases"] = _filter_bad_aliases(ent.get("aliases", []))
+       # Ensure source field is valid
+       if ent.get("source") not in ("verse", "purport", "both"):
+           ent["source"] = "verse"
        normalized_entities.append(ent)
    result["entities"] = normalized_entities
-
-
-   entity_names = {e["name"] for e in normalized_entities}
-
 
    normalized_rels = []
    for rel in result.get("relationships", []):
@@ -464,74 +511,32 @@ def normalize_extraction_result(result: dict) -> dict:
        tgt = rel.get("target", "").strip()
        rel["source"] = name_map.get(src) or name_map.get(src.lower()) or normalize_entity_name(src)
        rel["target"] = name_map.get(tgt) or name_map.get(tgt.lower()) or normalize_entity_name(tgt)
-       # Drop self-relationships or ones with empty/unknown names
-       if (rel["source"] and rel["target"]
-               and rel["source"] != rel["target"]):
+       if rel["source"] and rel["target"] and rel["source"] != rel["target"]:
            normalized_rels.append(rel)
    result["relationships"] = normalized_rels
 
-
-   for vs in result.get("verse_summaries", []):
-       fixed = []
-       for mention in vs.get("entities_mentioned", []):
-           if isinstance(mention, dict):
-               n = mention.get("name", "").strip()
-               mention["name"] = name_map.get(n) or name_map.get(n.lower()) or normalize_entity_name(n)
-               if mention["name"]:
-                   fixed.append(mention)
-           else:
-               canon = name_map.get(mention) or name_map.get(mention.lower()) or normalize_entity_name(mention)
-               if canon:
-                   fixed.append({"name": canon, "source": "verse"})
-       vs["entities_mentioned"] = fixed
-
+   # Normalize concepts: expect dict with name + description, or handle legacy strings
+   normalized_concepts = []
+   for c in result.get("concepts", []):
+       if isinstance(c, dict):
+           # New format: {"name": "...", "description": "..."}
+           name = c.get("name", "").strip().lower()
+           desc = c.get("description", "").strip()
+           if name:
+               normalized_concepts.append({"name": name, "description": desc})
+       elif isinstance(c, str):
+           # Legacy format: just a string name
+           name = c.strip().lower()
+           if name:
+               normalized_concepts.append({"name": name, "description": ""})
+   result["concepts"] = normalized_concepts
 
    return result
 
 
-
-
 # ---------------------------------------------------------------------------
-# Quality checks
+# Core extraction — 3-stage pipeline
 # ---------------------------------------------------------------------------
-
-
-def find_low_confidence_relationships(result: dict) -> list[dict]:
-   """Return relationships marked low-confidence or with structural issues."""
-   flagged = []
-   entity_names = {e["name"] for e in result.get("entities", [])}
-   for rel in result.get("relationships", []):
-       reasons = []
-       if rel.get("confidence", "high") == "low":
-           reasons.append("confidence=low")
-       if rel["source"] not in entity_names:
-           reasons.append(f"source '{rel['source']}' not in entities list")
-       if rel["target"] not in entity_names:
-           reasons.append(f"target '{rel['target']}' not in entities list")
-       if reasons:
-           flagged.append({**rel, "_reasons": reasons})
-   return flagged
-
-
-
-
-def format_flagged_for_hint(flagged: list[dict]) -> str:
-   lines = []
-   for r in flagged:
-       reasons = ", ".join(r.get("_reasons", []))
-       lines.append(
-           f'  - source="{r["source"]}" type="{r["type"]}" target="{r["target"]}" '
-           f'[{reasons}]'
-       )
-   return "\n".join(lines)
-
-
-
-
-# ---------------------------------------------------------------------------
-# Core extraction
-# ---------------------------------------------------------------------------
-
 
 def _build_verse_block(verse: dict) -> str:
    ref = verse.get("full_reference", "")
@@ -543,21 +548,15 @@ def _build_verse_block(verse: dict) -> str:
    return block
 
 
-
-
-def _call_gemini(prompt: str) -> dict:
-   """Single Gemini call with key pool management. Returns parsed dict."""
+def _call_gemini(prompt: str, system_instruction: str) -> dict:
+   """Single Gemini call. Returns parsed dict. Raises on error."""
    pool = get_pool()
    key = pool.acquire()
 
-
-   # Apply request delay for daily rate pacing (calculated based on number of keys)
    if pool.request_delay > 0:
        time.sleep(pool.request_delay)
 
-
    key.record_call()
-
 
    response = key.client.models.generate_content(
        model=MODEL,
@@ -565,7 +564,7 @@ def _call_gemini(prompt: str) -> dict:
        config=genai_types.GenerateContentConfig(
            temperature=0.1,
            response_mime_type="application/json",
-           system_instruction=SYSTEM_PROMPT,
+           system_instruction=system_instruction,
        ),
    )
    raw = response.text.strip()
@@ -574,93 +573,173 @@ def _call_gemini(prompt: str) -> dict:
    return json.loads(raw)
 
 
-
-
-def extract_from_verses(verses: list[dict], hint: str = "") -> dict:
-   """
-   Call Gemini to extract entities/relationships from verses (send 1 at a time).
-   If hint is provided (retry context), it is appended to the prompt.
-   """
-   verse_blocks = "\n\n---\n\n".join(_build_verse_block(v) for v in verses)
-   prompt = f"VERSE TO ANALYZE:\n\n{verse_blocks}"
-   if hint:
-       prompt += f"\n\n{hint}"
-
-
-   result = _call_gemini(prompt)
-   return normalize_extraction_result(result)
-
-
-
-
-def extract_with_retry(verses: list[dict], max_retries: int = 5) -> dict:
-   """
-   Full retry pipeline:
-   1. Extract from verses.
-   2. If low-confidence or structural issues found, retry with a hint
-      (up to MAX_VERIFY_RETRIES extra attempts).
-   3. On API errors, use exponential backoff (up to max_retries total attempts).
-   """
-   hint = ""
-   result = {"entities": [], "relationships": [], "verse_summaries": []}
-
-
-   for api_attempt in range(max_retries):
+def _safe_call(prompt: str, system_instruction: str, stage_name: str,
+               empty: dict, max_retries: int = 3) -> dict:
+   """Call Gemini with retry on transient errors. Returns empty on failure."""
+   for attempt in range(max_retries):
        try:
-           result = extract_from_verses(verses, hint=hint)
-           break
+           logger.info(f"    → Calling Gemini (attempt {attempt+1}/{max_retries})")
+           result = _call_gemini(prompt, system_instruction)
+           logger.info(f"    ✓ Gemini responded successfully")
+           return result
        except json.JSONDecodeError as e:
-           logger.error(f"JSON parse error attempt {api_attempt+1}: {e}")
-           if api_attempt == max_retries - 1:
-               return {"entities": [], "relationships": [], "verse_summaries": []}
-           time.sleep(5)
-           continue
+           logger.error(f"    ✗ [{stage_name}] JSON parse error (attempt {attempt+1}): {e}")
        except Exception as e:
-           err_str = str(e).lower()
-           is_retryable = any(x in err_str for x in ["429", "quota", "rate", "500", "503", "internal"])
-           if not is_retryable or api_attempt == max_retries - 1:
-               logger.error(f"Gemini error (non-retryable or max retries): {e}")
-               return {"entities": [], "relationships": [], "verse_summaries": []}
-           wait = 15 * (2 ** api_attempt)
-           logger.warning(f"Retryable error, waiting {wait}s: {e}")
+           err_str = str(e)
+           is_retryable = any(x in err_str for x in ["429", "quota", "rate", "500", "503"])
+           if not is_retryable:
+               logger.error(f"    ✗ [{stage_name}] Non-retryable error: {e}")
+               return empty
+           wait = 15 * (2 ** attempt)
+           logger.warning(f"    ⏳ [{stage_name}] Retryable error, waiting {wait}s (attempt {attempt+1}): {e}")
            time.sleep(wait)
-           continue
+   logger.error(f"    ✗ [{stage_name}] All {max_retries} attempts failed, returning empty.")
+   return empty
 
 
-   # Quality verification loop — retry if low-confidence relationships found
-   for verify_attempt in range(MAX_VERIFY_RETRIES):
-       flagged = find_low_confidence_relationships(result)
-       if not flagged:
-           break
-       logger.warning(
-           f"  Found {len(flagged)} uncertain relationship(s) — retry {verify_attempt+1}/{MAX_VERIFY_RETRIES}"
+def _stage1_entities_concepts(verse_block: str, ref: str) -> tuple[list, list]:
+   """Stage 1: Extract entities (with source) and concepts."""
+   logger.info(f"  ┌─ [Stage 1] Extracting entities + concepts")
+   prompt = f"VERSE TO ANALYZE:\n\n{verse_block}"
+   raw = _safe_call(prompt, STAGE1_SYSTEM, "Stage1", {"entities": [], "concepts": []})
+   entities = raw.get("entities", [])
+   concepts = raw.get("concepts", [])
+   logger.info(f"  ├─ [Stage 1] Raw result: {len(entities)} entities, {len(concepts)} concepts")
+   for e in entities:
+       src = e.get('source','?')
+       name = e.get('name','?')
+       etype = e.get('type','?')
+       desc = e.get('description','')
+       logger.info(f"  │   • [{etype:8s}] {name:25s} (source={src:7s})")
+       if desc:
+           logger.info(f"  │      → {desc}")
+   if concepts:
+       logger.info(f"  │   concepts: {concepts}")
+   logger.info(f"  └─ [Stage 1] Complete")
+   return entities, concepts
+
+
+def _stage2_relationships(verse_block: str, ref: str, entities: list) -> list:
+   """Stage 2: Extract relationships, constrained to the entity list from Stage 1."""
+   if not entities:
+       logger.info(f"  ├─ [Stage 2] Skipped (no entities from Stage 1)")
+       return []
+
+   entity_list_str = "\n".join(
+       f'  • {e["name"]} (type: {e.get("type","?")})'
+       for e in entities
+   )
+   prompt = (
+       f"VERSE TO ANALYZE:\n\n{verse_block}\n\n"
+       f"ENTITY LIST (you may ONLY relate these entities — no others):\n{entity_list_str}"
+   )
+   logger.info(f"  ├─ [Stage 2] Extracting relationships ({len(entities)} entities available)")
+   raw = _safe_call(prompt, STAGE2_SYSTEM, "Stage2", {"relationships": []})
+   rels = raw.get("relationships", [])
+   logger.info(f"  ├─ [Stage 2] Raw result: {len(rels)} relationships")
+   for r in rels:
+       src = r.get('source','?')
+       tgt = r.get('target','?')
+       typ = r.get('type','?')
+       ctx = r.get('context','')[:40]
+       logger.info(f"  │   • {src:20s} --[{typ:20s}]--> {tgt:20s}")
+       if ctx:
+           logger.info(f"  │      context: {ctx}")
+   logger.info(f"  └─ [Stage 2] Complete")
+   return rels
+
+
+def _stage3_verify(verse_block: str, ref: str,
+                   entities: list, relationships: list, concepts: list) -> tuple[list, list, list]:
+   """Stage 3: Verify and correct the extraction output."""
+   logger.info(f"  ├─ [Stage 3] Verifying extraction ({len(entities)} ents, {len(relationships)} rels, {len(concepts)} concepts)")
+   payload = json.dumps({
+       "entities": entities,
+       "relationships": relationships,
+       "concepts": concepts
+   }, ensure_ascii=False)
+   prompt = (
+       f"ORIGINAL TEXT:\n\n{verse_block}\n\n"
+       f"EXTRACTION TO REVIEW:\n{payload}"
+   )
+   raw = _safe_call(prompt, STAGE3_SYSTEM, "Stage3",
+                    {"entities": entities, "relationships": relationships, "concepts": concepts})
+
+   verified_entities = raw.get("entities", entities)
+   verified_rels = raw.get("relationships", relationships)
+   verified_concepts = raw.get("concepts", concepts)
+
+   # Log what changed
+   removed_entities = len(entities) - len(verified_entities)
+   removed_rels = len(relationships) - len(verified_rels)
+   removed_concepts = len(concepts) - len(verified_concepts)
+   
+   logger.info(f"  ├─ [Stage 3] Verification complete")
+   if removed_entities or removed_rels or removed_concepts:
+       logger.info(
+           f"  │   Corrections: -{removed_entities} entities, "
+           f"-{removed_rels} rels, -{removed_concepts} concepts"
        )
-       for f in flagged:
-           logger.warning(f"    {f['source']} --{f['type']}--> {f['target']} ({', '.join(f.get('_reasons', []))})")
+   else:
+       logger.info(f"  │   No corrections needed (all items valid)")
+   logger.info(f"  └─ [Stage 3] Complete")
+
+   return verified_entities, verified_rels, verified_concepts
 
 
-       hint = RETRY_HINT_TEMPLATE.format(flagged=format_flagged_for_hint(flagged))
-       try:
-           new_result = extract_from_verses(verses, hint=hint)
-           # Only accept the retry if it has at least as many entities
-           if len(new_result.get("entities", [])) >= len(result.get("entities", [])) // 2:
-               result = new_result
-           else:
-               logger.warning("  Retry returned fewer entities — keeping original")
-               break
-       except Exception as e:
-           logger.error(f"  Verification retry failed: {e}")
-           break
+def extract_with_retry(verses: list[dict], max_retries: int = 3) -> dict:
+   """
+   Run the 3-stage extraction pipeline for a single verse.
+   Returns a result dict with keys: entities, relationships, concepts.
+   All 3 stages must succeed for data to be returned; otherwise returns empty.
+   """
+   if not verses:
+       logger.error("extract_with_retry: no verses provided, returning empty")
+       return {"entities": [], "relationships": [], "concepts": []}
 
+   verse = verses[0]
+   ref = verse.get("full_reference", "?")
+   verse_block = _build_verse_block(verse)
 
-   # Final pass: drop any remaining low-confidence relationships
-   result["relationships"] = [
-       r for r in result.get("relationships", [])
-       if r.get("confidence", "high") != "low"
-   ]
+   logger.info(f"┌─────────────────────────────────────────────────────")
+   logger.info(f"│ Extraction Pipeline: {ref}")
+   logger.info(f"├─────────────────────────────────────────────────────")
 
+   # Stage 1: Entities + Concepts
+   entities, concepts = _stage1_entities_concepts(verse_block, ref)
+
+   # Stage 2: Relationships (only if we have entities)
+   relationships = _stage2_relationships(verse_block, ref, entities)
+
+   # Stage 3: Verification
+   entities, relationships, concepts = _stage3_verify(verse_block, ref, entities, relationships, concepts)
+
+   # Normalize names (canonical mappings, alias filtering)
+   logger.info(f"  ├─ Normalizing names and filtering...")
+   result = normalize_extraction_result({
+       "entities": entities,
+       "relationships": relationships,
+       "concepts": concepts,
+   })
+
+   e_count = len(result["entities"])
+   r_count = len(result["relationships"])
+   c_count = len(result["concepts"])
+   logger.info(f"  └─ Normalization complete")
+   logger.info(f"├─────────────────────────────────────────────────────")
+   logger.info(f"│ FINAL RESULT: {e_count} entities, {r_count} rels, {c_count} concepts")
+   logger.info(f"└─────────────────────────────────────────────────────")
 
    return result
+
+
+def find_low_confidence_relationships(result: dict) -> list[dict]:
+   """Kept for compatibility — no longer used in pipeline but may be called externally."""
+   return []
+
+
+def format_flagged_for_hint(flagged: list[dict]) -> str:
+   return ""
 
 
 
