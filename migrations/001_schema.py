@@ -103,48 +103,6 @@ def upgrade(conn):
         )
     ''')
 
-    # cursor.execute('''
-    #     CREATE TABLE IF NOT EXISTS entities (
-    #         id SERIAL PRIMARY KEY,
-    #         name VARCHAR(255) NOT NULL UNIQUE,
-    #         normalized_name VARCHAR(255),
-    #         entity_type VARCHAR(50),
-    #         description TEXT,
-    #         aliases_json TEXT,
-    #         image_url VARCHAR(500),
-    #         first_appearance_verse_id INTEGER,
-    #         CONSTRAINT fk_entities_verse FOREIGN KEY (first_appearance_verse_id) REFERENCES verses(id)
-    #     )
-    # ''')
-
-    # cursor.execute('''
-    #     CREATE TABLE IF NOT EXISTS verse_entities (
-    #         id SERIAL PRIMARY KEY,
-    #         verse_id INTEGER,
-    #         entity_id INTEGER,
-    #         mention_location VARCHAR(50),
-    #         mention_text TEXT,
-    #         context_summary TEXT,
-    #         confidence_score FLOAT DEFAULT 1.0,
-    #         CONSTRAINT fk_verse_entities_verse FOREIGN KEY (verse_id) REFERENCES verses(id),
-    #         CONSTRAINT fk_verse_entities_entity FOREIGN KEY (entity_id) REFERENCES entities(id)
-    #     )
-    # ''')
-
-    # cursor.execute('''
-    #     CREATE TABLE IF NOT EXISTS relationships (
-    #         id SERIAL PRIMARY KEY,
-    #         source_entity_id INTEGER,
-    #         target_entity_id INTEGER,
-    #         relationship_type VARCHAR(50),
-    #         source_verse_id INTEGER,
-    #         confidence_score FLOAT DEFAULT 1.0,
-    #         CONSTRAINT fk_relationships_source FOREIGN KEY (source_entity_id) REFERENCES entities(id),
-    #         CONSTRAINT fk_relationships_target FOREIGN KEY (target_entity_id) REFERENCES entities(id),
-    #         CONSTRAINT fk_relationships_verse FOREIGN KEY (source_verse_id) REFERENCES verses(id)
-    #     )
-    # ''')
-
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS scrape_jobs (
             id SERIAL PRIMARY KEY,
@@ -161,61 +119,63 @@ def upgrade(conn):
 
     # ── AI tables ─────────────────────────────────────────────────────────────
 
-    # cursor.execute('''
-    #     CREATE TABLE IF NOT EXISTS ai_entities (
-    #         id SERIAL PRIMARY KEY,
-    #         name VARCHAR(255) NOT NULL,
-    #         normalized_name VARCHAR(255) NOT NULL UNIQUE,
-    #         entity_type VARCHAR(50),
-    #         description TEXT,
-    #         aliases_json TEXT,
-    #         sanskrit_name VARCHAR(255),
-    #         first_seen_verse_id INTEGER,
-    #         mention_count INTEGER DEFAULT 1,
-    #         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    #         CONSTRAINT fk_ai_entities_verse FOREIGN KEY (first_seen_verse_id) REFERENCES verses(id)
-    #     )
-    # ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ai_entities (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            normalized_name VARCHAR(255) NOT NULL UNIQUE,
+            entity_type VARCHAR(50),
+            description TEXT,
+            aliases_json TEXT,
+            sanskrit_name VARCHAR(255),
+            first_seen_verse_id INTEGER,
+            mention_count INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_ai_entities_verse FOREIGN KEY (first_seen_verse_id) REFERENCES verses(id)
+        )
+    ''')
 
-    # cursor.execute('''
-    #     CREATE TABLE IF NOT EXISTS ai_relationships (
-    #         id SERIAL PRIMARY KEY,
-    #         source_entity_id INTEGER NOT NULL,
-    #         target_entity_id INTEGER NOT NULL,
-    #         relationship_type VARCHAR(50),
-    #         context TEXT,
-    #         source_verse_id INTEGER,
-    #         confidence FLOAT DEFAULT 1.0,
-    #         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    #         CONSTRAINT fk_ai_rel_source FOREIGN KEY (source_entity_id) REFERENCES ai_entities(id),
-    #         CONSTRAINT fk_ai_rel_target FOREIGN KEY (target_entity_id) REFERENCES ai_entities(id),
-    #         CONSTRAINT fk_ai_rel_verse FOREIGN KEY (source_verse_id) REFERENCES verses(id),
-    #         CONSTRAINT unique_ai_relationship UNIQUE(source_entity_id, target_entity_id, relationship_type)
-    #     )
-    # ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ai_relationships (
+            id SERIAL PRIMARY KEY,
+            source_entity_id INTEGER NOT NULL,
+            target_entity_id INTEGER NOT NULL,
+            relationship_type VARCHAR(50),
+            context TEXT,
+            source_verse_id INTEGER,
+            confidence FLOAT DEFAULT 1.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_ai_rel_source FOREIGN KEY (source_entity_id) REFERENCES ai_entities(id),
+            CONSTRAINT fk_ai_rel_target FOREIGN KEY (target_entity_id) REFERENCES ai_entities(id),
+            CONSTRAINT fk_ai_rel_verse FOREIGN KEY (source_verse_id) REFERENCES verses(id),
+            CONSTRAINT unique_ai_relationship UNIQUE(source_entity_id, target_entity_id, relationship_type)
+        )
+    ''')
 
-    # cursor.execute('''
-    #     CREATE TABLE IF NOT EXISTS ai_verse_entities (
-    #         id SERIAL PRIMARY KEY,
-    #         verse_id INTEGER NOT NULL,
-    #         entity_id INTEGER NOT NULL,
-    #         confidence FLOAT DEFAULT 1.0,
-    #         mention_source VARCHAR(20) DEFAULT 'verse',
-    #         CONSTRAINT fk_ai_ve_verse FOREIGN KEY (verse_id) REFERENCES verses(id),
-    #         CONSTRAINT fk_ai_ve_entity FOREIGN KEY (entity_id) REFERENCES ai_entities(id),
-    #         CONSTRAINT unique_ai_verse_entity UNIQUE(verse_id, entity_id)
-    #     )
-    # ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ai_verse_entities (
+            id SERIAL PRIMARY KEY,
+            verse_id INTEGER NOT NULL,
+            entity_id INTEGER NOT NULL,
+            confidence FLOAT DEFAULT 1.0,
+            mention_source VARCHAR(20) DEFAULT 'verse',
+            CONSTRAINT fk_ai_ve_verse FOREIGN KEY (verse_id) REFERENCES verses(id),
+            CONSTRAINT fk_ai_ve_entity FOREIGN KEY (entity_id) REFERENCES ai_entities(id),
+            CONSTRAINT unique_ai_verse_entity UNIQUE(verse_id, entity_id)
+        )
+    ''')
 
-    # cursor.execute('''
-    #     CREATE TABLE IF NOT EXISTS ai_verse_concepts (
-    #         id SERIAL PRIMARY KEY,
-    #         verse_id INTEGER NOT NULL,
-    #         concept VARCHAR(255) NOT NULL,
-    #         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    #         CONSTRAINT fk_ai_verse_concepts_verse FOREIGN KEY (verse_id) REFERENCES verses(id) ON DELETE CASCADE
-    #     )
-    # ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ai_verse_concepts (
+            id SERIAL PRIMARY KEY,
+            verse_id INTEGER NOT NULL,
+            concept_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_ai_verse_concepts_verse FOREIGN KEY (verse_id) REFERENCES verses(id) ON DELETE CASCADE,
+            CONSTRAINT fk_ai_verse_concepts_concept FOREIGN KEY (concept_id) REFERENCES ai_entities(id) ON DELETE CASCADE,
+            CONSTRAINT unique_ai_verse_concept UNIQUE(verse_id, concept_id)
+        )
+    ''')
 
     # ── Indexes ───────────────────────────────────────────────────────────────
 
@@ -234,7 +194,8 @@ def upgrade(conn):
     cursor.execute('CREATE INDEX IF NOT EXISTS ix_ai_verse_entities_verse ON ai_verse_entities(verse_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS ix_ai_verse_entities_entity ON ai_verse_entities(entity_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS ix_ai_verse_concepts_verse ON ai_verse_concepts(verse_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS ix_ai_verse_concepts_concept ON ai_verse_concepts(concept)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS ix_ai_verse_concepts_concept ON ai_verse_concepts(concept_id)')
+    cursor.execute('CREATE INDEX ix_ai_verse_concepts_concept_id ON ai_verse_concepts(concept_id)')
 
     conn.commit()
 
