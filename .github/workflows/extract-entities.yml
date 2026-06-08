@@ -2,8 +2,8 @@ name: Extract Entities Hourly
 
 on:
   schedule:
-    # Run every 8 hours at minute 0 (to allow 2h40m hours per chapter)
-    - cron: '0 */8 * * *'
+    # Run every 12 hours at minute 0 (to allow 2h40m hours per chapter)
+    - cron: '0 */12 * * *'
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
